@@ -14,9 +14,12 @@ class Settings(BaseSettings):
     embedding_dimensions: int = 1024
     chunk_size: int = 1500
     chunk_overlap: int = 50
-    base_url: str = "http://localhost:8000"
-    allowed_origins: list[str] = ["http://localhost:8000"]
-    allowed_hosts: list[str] = ["localhost"]
+    # Public hostname Traefik/Caddy routes to. When set, base_url, allowed_origins,
+    # and allowed_hosts are auto-derived (https + this host) unless overridden.
+    mcp_hostname: str | None = None
+    base_url: str | None = None
+    allowed_origins: list[str] | None = None
+    allowed_hosts: list[str] | None = None
 
     embedding_provider: Literal["ollama", "openai"] = "ollama"
     openai_api_key: str | None = None
@@ -24,6 +27,25 @@ class Settings(BaseSettings):
     openai_embedding_model: str = "text-embedding-3-small"
 
     model_config = {"env_file": ".env"}
+
+    @model_validator(mode="after")
+    def _derive_public_urls(self) -> "Settings":
+        if self.mcp_hostname:
+            public = f"https://{self.mcp_hostname}"
+            if self.base_url is None:
+                self.base_url = public
+            if self.allowed_origins is None:
+                self.allowed_origins = [public]
+            if self.allowed_hosts is None:
+                self.allowed_hosts = [self.mcp_hostname, "localhost"]
+        else:
+            if self.base_url is None:
+                self.base_url = "http://localhost:8000"
+            if self.allowed_origins is None:
+                self.allowed_origins = ["http://localhost:8000"]
+            if self.allowed_hosts is None:
+                self.allowed_hosts = ["localhost"]
+        return self
 
     @model_validator(mode="after")
     def _validate_provider_credentials(self) -> "Settings":

@@ -11,6 +11,7 @@ from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from sqlalchemy import text
 from starlette.types import ASGIApp, Receive, Scope, Send
+from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
 from src.api.routes import router as api_router
 from src.config import settings
@@ -76,6 +77,10 @@ app = FastAPI(title="Obsidian MCP", lifespan=lifespan)
 
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# Honor X-Forwarded-Proto/For from upstream reverse proxy so that scheme-aware
+# redirects (e.g. trailing-slash on /mcp) keep the https:// scheme.
+app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
 
 # GZip compression for responses >= 1000 bytes
 app.add_middleware(GZipMiddleware, minimum_size=1000)

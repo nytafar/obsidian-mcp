@@ -76,6 +76,28 @@ async def oauth_metadata():
     })
 
 
+# RFC 9728 protected-resource metadata. MCP clients probe both the bare path
+# and the resource-suffixed variant when discovering auth for /mcp.
+def _protected_resource_metadata() -> dict:
+    base = settings.base_url
+    return {
+        "resource": f"{base}/mcp",
+        "authorization_servers": [base],
+        "scopes_supported": ["read", "readwrite"],
+        "bearer_methods_supported": ["header"],
+    }
+
+
+@router.get("/.well-known/oauth-protected-resource")
+async def oauth_protected_resource():
+    return JSONResponse(_protected_resource_metadata())
+
+
+@router.get("/.well-known/oauth-protected-resource/mcp")
+async def oauth_protected_resource_mcp():
+    return JSONResponse(_protected_resource_metadata())
+
+
 # --- Dynamic Client Registration ---
 
 
