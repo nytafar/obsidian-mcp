@@ -1,0 +1,988 @@
+import logging
+import os
+import re
+import shutil
+import time
+from datetime import datetime, timezone
+from functools import wraps
+from pathlib import Path, PurePosixPath
+
+from src.database import async_session
+from src.mcp_server.auth import current_api_key_id, current_permission
+from src.models.db import UsageLog
+from src.services.embeddings import semantic_search
+from src.services.filters import apply_note_filters
+from src.services.search import full_text_search
+from src.services.vault import read_file, write_file
+
+logger = logging.getLogger(__name__)
+
+_VAULT_GUIDE_PRIMER = (Path(__file__).parent / "vault_guide_primer.md").read_text(
+    encoding="utf-8"
+)
+
+_NO_CLAUDE_MD_MESSAGE = (
+    "# Vault-Specific Conventions\n"
+    "\n"
+    "No `CLAUDE.md` found at the vault root. To teach the agent about your\n"
+    "folder structure, file-naming conventions, tag taxonomy, required\n"
+    "frontmatter fields, or task-management syntax, create a `CLAUDE.md`\n"
+    "file at the root of your vault. The agent will pick it up automatically\n"
+    "on the next call.\n"
+    "\n"
+    "Suggested sections:\n"
+    "\n"
+    "- **Folder structure** — what lives where, and where new notes belong.\n"
+    "- **Naming conventions** — how filenames are formatted.\n"
+    "- **Frontmatter** — required and conventional YAML fields.\n"
+    "- **Tag taxonomy** — top-level tags and their meaning.\n"
+    "- **Task syntax** — any GTD/Dataview/checklist conventions in use.\n"
+)
+
+
+async def _log_usage(tool: str, params: dict, duration_ms: int, response_size: int):
+    try:
+        async with async_session() as session:
+            session.add(UsageLog(
+                key_id=current_api_key_id.get(),
+                tool=tool,
+                params=params,
+                duration_ms=duration_ms,
+                response_size=response_size,
+            ))
+            await session.commit()
+    except Exception as e:
+        logger.warning(f"Failed to log usage for {tool}: {e}")
+
+
+_MAX_PARAM_LEN = 200  # truncate long string params (e.g. note content)
+
+
+def _truncate_params(params: dict) -> dict:
+    return {
+        k: (v[:_MAX_PARAM_LEN] + "…" if isinstance(v, str) and len(v) > _MAX_PARAM_LEN else v)
+        for k, v in params.items()
+    }
+
+
+def _tracked(tool_name: str, param_keys: list[str]):
+    """Decorator that times the call and logs it to usage_logs."""
+    def decorator(fn):
+        @wraps(fn)
+        async def wrapper(*args, **kwargs):
+            start = time.monotonic()
+            result = await fn(*args, **kwargs)
+            duration_ms = int((time.monotonic() - start) * 1000)
+            params = {}
+            for i, key in enumerate(param_keys):
+                if i < len(args):
+                    params[key] = args[i]
+                elif key in kwargs:
+                    params[key] = kwargs[key]
+            await _log_usage(tool_name, _truncate_params(params), duration_ms, len(str(result)))
+            return result
+        return wrapper
+    return decorator
+
+
+@_tracked("search_notes", ["query", "folder", "limit", "tags", "frontmatter"])
+async def search_notes_impl(
+    query: str,
+    folder: str | None = None,
+    limit: int = 20,
+    tags: list[str] | None = None,
+    frontmatter: dict | None = None,
+) -> str:
+    """Full-text keyword search across vault notes."""
+    async with async_session() as session:
+        results = await full_text_search(
+            session,
+            query,
+            folder=folder,
+            limit=limit,
+            tags=tags,
+            frontmatter=frontmatter,
+        )
+    if not results:
+        return f"No results for '{query}'"
+    lines = [f"Found {len(results)} results for '{query}':\n"]
+    for r in results:
+        tags_str = f" [{', '.join(r['tags'])}]" if r.get("tags") else ""
+        lines.append(f"- **{r['title']}** (`{r['path']}`){tags_str} — rank: {r['rank']:.3f}")
+    return "\n".join(lines)
+
+
+@_tracked("read_note", ["path"])
+async def read_note_impl(path: str) -> str:
+    """Read a note by its vault-relative path."""
+    try:
+        note = read_file(path)
+    except FileNotFoundError:
+        return f"Note not found: {path}"
+    except ValueError as e:
+        return str(e)
+
+    parts = [f"# {note['title']}\n**Path:** `{note['path']}`"]
+    if note["tags"]:
+        parts.append(f"**Tags:** {', '.join(note['tags'])}")
+    if note["frontmatter"]:
+        fm_lines = [f"  {k}: {v}" for k, v in note["frontmatter"].items() if k not in ("title", "tags")]
+        if fm_lines:
+            parts.append("**Frontmatter:**\n" + "\n".join(fm_lines))
+    parts.append(f"\n---\n{note['content']}")
+    return "\n".join(parts)
+
+
+@_tracked("list_notes", ["folder", "limit", "tags", "frontmatter"])
+async def list_notes_impl(
+    folder: str = "",
+    limit: int = 50,
+    tags: list[str] | None = None,
+    frontmatter: dict | None = None,
+) -> str:
+    """List notes in a vault folder, sourced from the index."""
+    from sqlalchemy import select
+    from src.models.db import NoteMetadata
+
+    async with async_session() as session:
+        stmt = select(NoteMetadata).order_by(NoteMetadata.modified_at.desc())
+        stmt = apply_note_filters(
+            stmt, folder=folder or None, tags=tags, frontmatter=frontmatter
+        )
+        stmt = stmt.limit(limit)
+        result = await session.execute(stmt)
+        notes = result.scalars().all()
+
+    if not notes:
+        return f"No markdown files in '{folder or '/'}'"
+
+    lines = [f"Found {len(notes)} notes in '{folder or '/'}':\n"]
+    for n in notes:
+        if n.modified_at:
+            mod = n.modified_at.astimezone(timezone.utc).strftime("%Y-%m-%d")
+        else:
+            mod = "unknown"
+        size = n.file_size or 0
+        lines.append(f"- `{n.file_path}` ({size:,}B, modified {mod})")
+    return "\n".join(lines)
+
+
+@_tracked("get_tags", ["limit"])
+async def get_tags_impl(limit: int = 50) -> str:
+    """List all tags with counts."""
+    from sqlalchemy import func, select
+    from src.models.db import NoteMetadata
+
+    async with async_session() as session:
+        result = await session.execute(
+            select(
+                func.unnest(NoteMetadata.tags).label("tag"),
+                func.count().label("count"),
+            )
+            .group_by("tag")
+            .order_by(func.count().desc())
+            .limit(limit)
+        )
+        rows = result.fetchall()
+
+    if not rows:
+        return "No tags found"
+
+    lines = [f"Top {len(rows)} tags:\n"]
+    for row in rows:
+        lines.append(f"- #{row.tag} ({row.count})")
+    return "\n".join(lines)
+
+
+@_tracked("get_recent", ["limit", "folder", "tags", "frontmatter"])
+async def get_recent_impl(
+    limit: int = 20,
+    folder: str | None = None,
+    tags: list[str] | None = None,
+    frontmatter: dict | None = None,
+) -> str:
+    """Recently modified notes."""
+    from sqlalchemy import select
+    from src.models.db import NoteMetadata
+
+    async with async_session() as session:
+        query = select(NoteMetadata).order_by(NoteMetadata.modified_at.desc())
+        query = apply_note_filters(query, folder=folder, tags=tags, frontmatter=frontmatter)
+        query = query.limit(limit)
+        result = await session.execute(query)
+        notes = result.scalars().all()
+
+    if not notes:
+        return "No recent notes found"
+
+    lines = [f"Last {len(notes)} modified notes:\n"]
+    for n in notes:
+        mod = n.modified_at.strftime("%Y-%m-%d %H:%M") if n.modified_at else "unknown"
+        tags_str = f" [{', '.join(n.tags)}]" if n.tags else ""
+        lines.append(f"- `{n.file_path}` — {n.title}{tags_str} (modified {mod})")
+    return "\n".join(lines)
+
+
+@_tracked("semantic_search", ["query", "limit", "folder", "tags", "frontmatter"])
+async def semantic_search_impl(
+    query: str,
+    limit: int = 10,
+    folder: str | None = None,
+    tags: list[str] | None = None,
+    frontmatter: dict | None = None,
+) -> str:
+    """Vector similarity search using bge-m3 embeddings."""
+    async with async_session() as session:
+        results = await semantic_search(
+            session,
+            query,
+            limit=limit,
+            folder=folder,
+            tags=tags,
+            frontmatter=frontmatter,
+        )
+    if not results:
+        return f"No semantic results for '{query}' (embeddings may still be building)"
+    lines = [f"Found {len(results)} semantic matches for '{query}':\n"]
+    for r in results:
+        tags_str = f" [{', '.join(r['tags'])}]" if r.get("tags") else ""
+        lines.append(f"- **{r['title']}** (`{r['path']}`){tags_str} — similarity: {r['similarity']:.3f}")
+        lines.append(f"  > {r['chunk'][:200]}...")
+    return "\n".join(lines)
+
+
+@_tracked("get_vault_guide", [])
+async def get_vault_guide_impl() -> str:
+    """Return the Obsidian primer plus any vault-specific conventions from CLAUDE.md."""
+    try:
+        note = read_file("CLAUDE.md")
+        vault_section = (
+            "# Vault-Specific Conventions\n"
+            "\n"
+            f"{note['content']}"
+        )
+    except FileNotFoundError:
+        vault_section = _NO_CLAUDE_MD_MESSAGE
+    except ValueError as e:
+        vault_section = f"# Vault-Specific Conventions\n\n{e}"
+    return f"{_VAULT_GUIDE_PRIMER}\n\n---\n\n{vault_section}"
+
+
+def _require_write() -> str | None:
+    """Return an error message if current key lacks write permission."""
+    if current_permission.get() != "readwrite":
+        return "Permission denied: this API key has read-only access. A 'readwrite' key is required."
+    return None
+
+
+MAX_NOTE_BYTES = 10 * 1024 * 1024  # 10 MB
+
+
+@_tracked("create_note", ["path"])
+async def create_note_impl(path: str, content: str) -> str:
+    """Create a new note in the vault."""
+    if err := _require_write():
+        return err
+    encoded = content.encode("utf-8")
+    if len(encoded) > MAX_NOTE_BYTES:
+        return f"Content too large ({len(encoded)} bytes, max {MAX_NOTE_BYTES})"
+    if not path.endswith(".md"):
+        path += ".md"
+    try:
+        from src.services.vault import validate_path
+        full_path = validate_path(path)
+        if full_path.exists():
+            return f"Note already exists: {path}. Use edit_note to modify it."
+        write_file(path, content)
+        return f"Created note: {path}"
+    except ValueError as e:
+        return str(e)
+
+
+@_tracked("get_backlinks", ["path", "limit"])
+async def get_backlinks_impl(path: str, limit: int = 50) -> str:
+    """Notes that link TO `path` (resolved links only)."""
+    from sqlalchemy import select
+    from src.models.db import NoteLink, NoteMetadata
+
+    limit = max(1, min(limit, 500))
+    async with async_session() as session:
+        target = (await session.execute(
+            select(NoteMetadata).where(NoteMetadata.file_path == path)
+        )).scalar_one_or_none()
+        if target is None:
+            return f"Note not found: {path}"
+
+        SourceMeta = NoteMetadata
+        stmt = (
+            select(
+                SourceMeta.file_path,
+                SourceMeta.title,
+                NoteLink.link_text,
+                NoteLink.position,
+                NoteLink.kind,
+            )
+            .join(SourceMeta, NoteLink.source_note_id == SourceMeta.id)
+            .where(NoteLink.target_note_id == target.id)
+            .order_by(SourceMeta.file_path, NoteLink.position)
+            .limit(limit)
+        )
+        rows = (await session.execute(stmt)).all()
+
+    if not rows:
+        return f"No backlinks to `{path}`"
+    lines = [f"Found {len(rows)} backlinks to `{path}`:\n"]
+    for r in rows:
+        excerpt = (r.link_text or "").replace("\n", " ")[:120]
+        lines.append(
+            f"- **{r.title}** (`{r.file_path}`) — {r.kind} `{excerpt}` @ pos {r.position}"
+        )
+    return "\n".join(lines)
+
+
+@_tracked("get_links", ["path"])
+async def get_links_impl(path: str) -> str:
+    """Outgoing links from `path` — both resolved and dangling."""
+    from sqlalchemy import select
+    from sqlalchemy.orm import aliased
+    from src.models.db import NoteLink, NoteMetadata
+
+    async with async_session() as session:
+        source = (await session.execute(
+            select(NoteMetadata).where(NoteMetadata.file_path == path)
+        )).scalar_one_or_none()
+        if source is None:
+            return f"Note not found: {path}"
+
+        TargetMeta = aliased(NoteMetadata)
+        stmt = (
+            select(
+                NoteLink.kind,
+                NoteLink.link_text,
+                NoteLink.position,
+                NoteLink.target_path,
+                NoteLink.target_note_id,
+                TargetMeta.file_path,
+                TargetMeta.title,
+            )
+            .outerjoin(TargetMeta, NoteLink.target_note_id == TargetMeta.id)
+            .where(NoteLink.source_note_id == source.id)
+            .order_by(NoteLink.position)
+        )
+        rows = (await session.execute(stmt)).all()
+
+    if not rows:
+        return f"`{path}` has no outgoing links"
+    resolved = [r for r in rows if r.target_note_id is not None]
+    dangling = [r for r in rows if r.target_note_id is None]
+    lines = [f"`{path}` — {len(resolved)} resolved, {len(dangling)} dangling:\n"]
+    if resolved:
+        lines.append("**Resolved:**")
+        for r in resolved:
+            lines.append(
+                f"- {r.kind} → **{r.title}** (`{r.file_path}`) — `{r.link_text}`"
+            )
+    if dangling:
+        lines.append("\n**Dangling:**")
+        for r in dangling:
+            lines.append(f"- {r.kind} → `{r.target_path}` — `{r.link_text}`")
+    return "\n".join(lines)
+
+
+@_tracked("get_neighborhood", ["path", "depth", "limit"])
+async def get_neighborhood_impl(path: str, depth: int = 1, limit: int = 50) -> str:
+    """BFS over the resolved-link graph treating links as undirected."""
+    from sqlalchemy import or_, select
+    from src.models.db import NoteLink, NoteMetadata
+
+    depth = max(1, min(depth, 5))
+    limit = max(1, min(limit, 200))
+
+    async with async_session() as session:
+        source = (await session.execute(
+            select(NoteMetadata).where(NoteMetadata.file_path == path)
+        )).scalar_one_or_none()
+        if source is None:
+            return f"Note not found: {path}"
+
+        # BFS state.
+        seen: dict[int, dict] = {source.id: {"distance": 0, "via": None}}
+        frontier: list[int] = [source.id]
+        truncated = False
+
+        for d in range(1, depth + 1):
+            if not frontier:
+                break
+            stmt = select(
+                NoteLink.source_note_id,
+                NoteLink.target_note_id,
+            ).where(
+                or_(
+                    NoteLink.source_note_id.in_(frontier),
+                    NoteLink.target_note_id.in_(frontier),
+                ),
+                NoteLink.target_note_id.isnot(None),
+            )
+            edges = (await session.execute(stmt)).all()
+            next_frontier: list[int] = []
+            for src_id, tgt_id in edges:
+                # Walk both directions.
+                for from_id, to_id in ((src_id, tgt_id), (tgt_id, src_id)):
+                    if from_id in seen and to_id not in seen:
+                        seen[to_id] = {"distance": d, "via": from_id}
+                        next_frontier.append(to_id)
+                        if len(seen) - 1 >= limit:
+                            truncated = True
+                            break
+                if truncated:
+                    break
+            frontier = next_frontier
+            if truncated:
+                break
+
+        # Hydrate metadata for everything except the source.
+        ids = [nid for nid in seen if nid != source.id]
+        if not ids:
+            return f"`{path}` has no resolved-link neighbors"
+        meta_rows = (await session.execute(
+            select(NoteMetadata).where(NoteMetadata.id.in_(ids))
+        )).scalars().all()
+        meta_by_id = {m.id: m for m in meta_rows}
+        # We also need `via` paths — fetch those.
+        via_ids = {seen[nid]["via"] for nid in ids if seen[nid]["via"] is not None}
+        via_paths = {source.id: source.file_path}
+        if via_ids - {source.id}:
+            via_rows = (await session.execute(
+                select(NoteMetadata.id, NoteMetadata.file_path).where(
+                    NoteMetadata.id.in_(via_ids)
+                )
+            )).all()
+            for vid, vpath in via_rows:
+                via_paths[vid] = vpath
+
+    ordered = sorted(ids, key=lambda nid: (seen[nid]["distance"], meta_by_id[nid].file_path))
+    lines = [
+        f"Neighborhood of `{path}` (depth ≤ {depth}, {len(ordered)} notes"
+        + (", truncated" if truncated else "") + "):\n"
+    ]
+    for nid in ordered:
+        m = meta_by_id[nid]
+        info = seen[nid]
+        via_path = via_paths.get(info["via"], "?")
+        tags_str = f" [{', '.join(m.tags)}]" if m.tags else ""
+        lines.append(
+            f"- d={info['distance']} **{m.title}** (`{m.file_path}`){tags_str} via `{via_path}`"
+        )
+    return "\n".join(lines)
+
+
+@_tracked("find_related", ["path", "limit"])
+async def find_related_impl(path: str, limit: int = 10) -> str:
+    """Semantic neighbors via averaged chunk embeddings."""
+    import numpy as np
+    from sqlalchemy import select
+    from src.models.db import NoteEmbedding, NoteMetadata
+
+    limit = max(1, min(limit, 50))
+
+    async with async_session() as session:
+        source = (await session.execute(
+            select(NoteMetadata).where(NoteMetadata.file_path == path)
+        )).scalar_one_or_none()
+        if source is None:
+            return f"Note not found: {path}"
+
+        chunks = (await session.execute(
+            select(NoteEmbedding.embedding).where(NoteEmbedding.note_id == source.id)
+        )).scalars().all()
+        if not chunks:
+            return (
+                f"`{path}` has not been embedded yet — "
+                "the indexer is still catching up. Try again in a few minutes."
+            )
+
+        avg = np.mean([np.asarray(c, dtype=float) for c in chunks], axis=0)
+        avg_list = avg.tolist()
+
+        # Pull more than `limit` so we can dedupe by note.
+        stmt = (
+            select(
+                NoteEmbedding.note_id,
+                NoteEmbedding.chunk_text,
+                NoteEmbedding.embedding,
+                NoteMetadata.file_path,
+                NoteMetadata.title,
+                NoteMetadata.tags,
+            )
+            .join(NoteMetadata, NoteEmbedding.note_id == NoteMetadata.id)
+            .where(NoteEmbedding.note_id != source.id)
+            .order_by(NoteEmbedding.embedding.cosine_distance(avg_list))
+            .limit(limit * 5)
+        )
+        rows = (await session.execute(stmt)).all()
+
+    if not rows:
+        return f"No related notes for `{path}`"
+
+    # Dedupe by note_id, keeping the highest-similarity chunk.
+    avg_norm = float(np.linalg.norm(avg)) or 1.0
+    best: dict[int, dict] = {}
+    for r in rows:
+        emb = np.asarray(r.embedding, dtype=float)
+        sim = float(np.dot(emb, avg) / ((np.linalg.norm(emb) or 1.0) * avg_norm))
+        prev = best.get(r.note_id)
+        if prev is None or sim > prev["similarity"]:
+            best[r.note_id] = {
+                "path": r.file_path,
+                "title": r.title,
+                "tags": r.tags,
+                "similarity": sim,
+                "chunk": r.chunk_text,
+            }
+
+    ranked = sorted(best.values(), key=lambda x: x["similarity"], reverse=True)[:limit]
+    lines = [f"Top {len(ranked)} related notes for `{path}`:\n"]
+    for r in ranked:
+        tags_str = f" [{', '.join(r['tags'])}]" if r["tags"] else ""
+        snippet = r["chunk"].replace("\n", " ")[:200]
+        lines.append(
+            f"- **{r['title']}** (`{r['path']}`){tags_str} — sim: {r['similarity']:.3f}"
+        )
+        lines.append(f"  > {snippet}…")
+    return "\n".join(lines)
+
+
+@_tracked("find_orphans", ["folder", "limit"])
+async def find_orphans_impl(folder: str | None = None, limit: int = 50) -> str:
+    """Notes with zero incoming AND zero outgoing resolved links."""
+    from sqlalchemy import select, union
+    from src.models.db import NoteLink, NoteMetadata
+
+    limit = max(1, min(limit, 500))
+
+    async with async_session() as session:
+        sources = select(NoteLink.source_note_id.label("nid")).where(
+            NoteLink.source_note_id.isnot(None)
+        )
+        targets = select(NoteLink.target_note_id.label("nid")).where(
+            NoteLink.target_note_id.isnot(None)
+        )
+        connected = union(sources, targets).subquery()
+        stmt = select(NoteMetadata).where(NoteMetadata.id.notin_(select(connected.c.nid)))
+        stmt = apply_note_filters(stmt, folder=folder)
+        stmt = stmt.order_by(NoteMetadata.modified_at.desc().nullslast()).limit(limit)
+        notes = (await session.execute(stmt)).scalars().all()
+
+    if not notes:
+        scope = f" in `{folder}`" if folder else ""
+        return f"No orphan notes{scope}"
+    lines = [f"Found {len(notes)} orphan notes:\n"]
+    for n in notes:
+        mod = n.modified_at.strftime("%Y-%m-%d") if n.modified_at else "unknown"
+        tags_str = f" [{', '.join(n.tags)}]" if n.tags else ""
+        lines.append(f"- `{n.file_path}` — {n.title}{tags_str} (modified {mod})")
+    return "\n".join(lines)
+
+
+@_tracked(
+    "edit_note",
+    ["path", "append", "find", "section", "replace_all", "dry_run"],
+)
+async def edit_note_impl(
+    path: str,
+    content: str,
+    append: bool = False,
+    find: str | None = None,
+    section: str | None = None,
+    replace_all: bool = False,
+    dry_run: bool = False,
+) -> str:
+    """Edit an existing note in the vault."""
+    if err := _require_write():
+        return err
+
+    selected = []
+    if append:
+        selected.append("append=True")
+    if find is not None:
+        selected.append("find=...")
+    if section is not None:
+        selected.append("section=...")
+    if len(selected) > 1:
+        return (
+            "edit_note: choose at most one of append, find, section "
+            f"(got {', '.join(selected)})."
+        )
+
+    try:
+        from src.services.vault import replace_section, validate_path
+        full_path = validate_path(path)
+    except ValueError as e:
+        return str(e)
+    if not full_path.exists():
+        return f"Note not found: {path}. Use create_note to create it."
+
+    try:
+        existing = full_path.read_text(encoding="utf-8")
+    except Exception as e:
+        return f"Failed to read {path}: {e}"
+
+    new_content: str | None = None
+    success_message: str = f"Updated note: {path}"
+
+    if section is not None:
+        new_content, err = replace_section(existing, section, content)
+        if err is not None:
+            return err
+    elif find is not None:
+        count = existing.count(find)
+        if count == 0:
+            preview = existing[:500]
+            return (
+                f"Find text not found in {path}. "
+                f"First 500 chars of note:\n---\n{preview}\n---"
+            )
+        if count > 1 and not replace_all:
+            return (
+                f"Find text matches {count} locations in {path}. "
+                "Provide more surrounding context to match a unique section, "
+                "or set replace_all=True."
+            )
+        if replace_all:
+            new_content = existing.replace(find, content)
+            success_message = (
+                f"Replaced {count} occurrence(s) in {path}"
+            )
+        else:
+            new_content = existing.replace(find, content, 1)
+    elif append:
+        new_content = existing + "\n" + content
+    else:
+        new_content = content
+
+    if dry_run:
+        if new_content == existing:
+            return f"No changes for {path}"
+        import difflib
+        diff = "".join(difflib.unified_diff(
+            existing.splitlines(keepends=True),
+            new_content.splitlines(keepends=True),
+            fromfile=path,
+            tofile=path,
+            lineterm="",
+        ))
+        return diff or f"No changes for {path}"
+
+    try:
+        write_file(path, new_content)
+    except ValueError as e:
+        return str(e)
+    return success_message
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# move_note
+# ────────────────────────────────────────────────────────────────────────────
+
+
+_WIKILINK_REWRITE_RE = re.compile(
+    r"(?P<embed>!)?\[\[(?P<target>[^\]\|#\n]+)"
+    r"(?P<rest>(?:#[^\]\|\n]*)?(?:\|[^\]\n]*)?)\]\]"
+)
+_MDLINK_REWRITE_RE = re.compile(
+    r"\[(?P<text>[^\]\n]+)\]\((?P<href>[^)\s]+?\.md)(?P<anchor>#[^)]*)?\)"
+)
+
+
+def _rewrite_links_in_text(
+    content: str,
+    from_rel: str,
+    to_rel: str,
+    source_path: str,
+    pre_move_index: dict,
+) -> tuple[str, int]:
+    """Rewrite any wikilink/embed/markdown-link in `content` whose pre-move
+    resolution would have pointed at `from_rel`, so it now refers to `to_rel`.
+
+    Preserves alias (`|...`) and anchor (`#...`) parts. For wikilinks, a bare
+    target stays bare (uses the new stem), while a path-style target is
+    rewritten to the full new path-style form (preserving any trailing `.md`).
+    Markdown links always get the new full path. Code blocks are skipped.
+    """
+    from src.services.links import mask_code, resolve_target
+
+    paths = pre_move_index.get("paths", {})
+    from_id = paths.get(from_rel)
+    if from_id is None:
+        return content, 0
+
+    to_stem = PurePosixPath(to_rel).stem
+    to_no_md = to_rel[:-3] if to_rel.endswith(".md") else to_rel
+
+    masked = mask_code(content)
+    rewrites: list[tuple[int, int, str]] = []
+
+    for m in _WIKILINK_REWRITE_RE.finditer(masked):
+        target_raw = m.group("target")
+        target = target_raw.strip()
+        if not target:
+            continue
+        if resolve_target(target, source_path, pre_move_index) != from_id:
+            continue
+        target_no_md = target[:-3] if target.endswith(".md") else target
+        is_path_style = "/" in target_no_md or target.endswith(".md")
+        if is_path_style:
+            new_target = to_no_md + (".md" if target.endswith(".md") else "")
+        else:
+            new_target = to_stem
+        embed_prefix = "!" if m.group("embed") else ""
+        rest = m.group("rest") or ""
+        rewrites.append((m.start(), m.end(), f"{embed_prefix}[[{new_target}{rest}]]"))
+
+    for m in _MDLINK_REWRITE_RE.finditer(masked):
+        href = m.group("href").strip()
+        if not href:
+            continue
+        target_for_resolve = href[:-3] if href.endswith(".md") else href
+        if resolve_target(target_for_resolve, source_path, pre_move_index) != from_id:
+            continue
+        anchor = m.group("anchor") or ""
+        rewrites.append((
+            m.start(),
+            m.end(),
+            f"[{m.group('text')}]({to_rel}{anchor})",
+        ))
+
+    if not rewrites:
+        return content, 0
+    rewrites.sort(key=lambda r: r[0], reverse=True)
+    out = content
+    for start, end, replacement in rewrites:
+        out = out[:start] + replacement + out[end:]
+    return out, len(rewrites)
+
+
+@_tracked("move_note", ["from_path", "to_path", "rewrite_links"])
+async def move_note_impl(
+    from_path: str,
+    to_path: str,
+    rewrite_links: bool = False,
+) -> str:
+    """Move (rename or relocate) a note inside the vault."""
+    if err := _require_write():
+        return err
+
+    from sqlalchemy import select, update
+    from src.models.db import NoteLink, NoteMetadata
+    from src.services.links import build_vault_index
+    from src.services.vault import _vault_root, validate_path
+
+    try:
+        src_full = validate_path(from_path)
+        dst_full = validate_path(to_path)
+    except ValueError as e:
+        return str(e)
+    if not src_full.is_file():
+        return f"Source note not found: {from_path}"
+    if dst_full.exists():
+        return f"Destination already exists: {to_path}"
+
+    vault = _vault_root().resolve()
+    from_rel = src_full.resolve().relative_to(vault).as_posix()
+    to_rel = dst_full.resolve().relative_to(vault).as_posix()
+
+    pre_move_index: dict | None = None
+    rewrite_sources: list[str] = []
+    if rewrite_links:
+        async with async_session() as session:
+            rows = (await session.execute(
+                select(NoteMetadata.file_path, NoteMetadata.id)
+            )).all()
+            pre_move_index = build_vault_index([(r.file_path, r.id) for r in rows])
+            target_id = pre_move_index["paths"].get(from_rel)
+            if target_id is not None:
+                src_rows = (await session.execute(
+                    select(NoteMetadata.file_path)
+                    .join(NoteLink, NoteLink.source_note_id == NoteMetadata.id)
+                    .where(NoteLink.target_note_id == target_id)
+                    .distinct()
+                )).all()
+                rewrite_sources = [r.file_path for r in src_rows]
+
+    dst_full.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.replace(src_full, dst_full)
+    except OSError as e:
+        if getattr(e, "errno", None) == 18:
+            logger.warning(
+                "Cross-FS move for %s → %s; using shutil.move", from_rel, to_rel
+            )
+            shutil.move(str(src_full), str(dst_full))
+        else:
+            return f"Move failed: {e}"
+
+    db_failed = False
+    try:
+        async with async_session() as session:
+            await session.execute(
+                update(NoteMetadata)
+                .where(NoteMetadata.file_path == from_rel)
+                .values(file_path=to_rel)
+            )
+            await session.execute(
+                update(NoteLink)
+                .where(NoteLink.target_path == from_rel)
+                .values(target_path=to_rel)
+            )
+            await session.commit()
+    except Exception as e:
+        logger.warning(
+            "DB update failed after FS move %s → %s: %s", from_rel, to_rel, e
+        )
+        db_failed = True
+
+    rewrites_done = 0
+    files_modified = 0
+    if rewrite_links and pre_move_index is not None:
+        for src_path in rewrite_sources:
+            try:
+                src_file = validate_path(src_path)
+                if not src_file.is_file():
+                    continue
+                content = src_file.read_text(encoding="utf-8")
+                new_content, n = _rewrite_links_in_text(
+                    content, from_rel, to_rel, src_path, pre_move_index
+                )
+                if n > 0:
+                    write_file(src_path, new_content)
+                    rewrites_done += n
+                    files_modified += 1
+            except Exception as e:
+                logger.warning("Failed to rewrite links in %s: %s", src_path, e)
+
+    parts = [f"Moved {from_rel} → {to_rel}"]
+    if db_failed:
+        parts.append("(warning: DB update failed; reindex will reconcile)")
+    if rewrite_links:
+        parts.append(
+            f"rewrote {rewrites_done} link(s) across {files_modified} note(s)"
+        )
+    return " — ".join(parts) if len(parts) > 1 else parts[0]
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# delete_note
+# ────────────────────────────────────────────────────────────────────────────
+
+
+@_tracked("delete_note", ["path", "permanent"])
+async def delete_note_impl(path: str, permanent: bool = False) -> str:
+    """Soft-delete a note to `.trash/`, or `os.unlink` it when `permanent=True`."""
+    if err := _require_write():
+        return err
+
+    from src.services.vault import _vault_root, validate_path
+
+    try:
+        full_path = validate_path(path)
+    except ValueError as e:
+        return str(e)
+    if not full_path.is_file():
+        return f"Note not found: {path}"
+
+    if permanent:
+        try:
+            os.unlink(full_path)
+        except OSError as e:
+            return f"Permanent delete failed: {e}"
+        return f"Permanently deleted: {path}"
+
+    vault = _vault_root()
+    trash = vault / ".trash"
+    trash.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    base = f"{timestamp}-{full_path.name}"
+    dest = trash / base
+    counter = 1
+    while dest.exists():
+        dest = trash / f"{timestamp}-{counter}-{full_path.name}"
+        counter += 1
+    try:
+        os.replace(full_path, dest)
+    except OSError as e:
+        if getattr(e, "errno", None) == 18:
+            shutil.move(str(full_path), str(dest))
+        else:
+            return f"Soft-delete failed: {e}"
+    rel = dest.relative_to(vault).as_posix()
+    return f"Soft-deleted: {path} → {rel}"
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# set_frontmatter
+# ────────────────────────────────────────────────────────────────────────────
+
+
+@_tracked("set_frontmatter", ["path"])
+async def set_frontmatter_impl(
+    path: str,
+    updates: dict | None = None,
+    remove: list[str] | None = None,
+) -> str:
+    """Merge `updates` into a note's YAML frontmatter and drop keys in `remove`."""
+    if err := _require_write():
+        return err
+
+    updates = dict(updates or {})
+    remove = list(remove or [])
+
+    from src.services.vault import (
+        parse_frontmatter,
+        serialize_frontmatter,
+        validate_path,
+    )
+
+    try:
+        full_path = validate_path(path)
+    except ValueError as e:
+        return str(e)
+    if not full_path.is_file():
+        return f"Note not found: {path}"
+
+    if not updates and not remove:
+        return f"No changes for {path} (empty updates and remove)"
+
+    try:
+        raw = full_path.read_text(encoding="utf-8")
+    except Exception as e:
+        return f"Failed to read {path}: {e}"
+
+    fm, body = parse_frontmatter(raw)
+
+    set_keys: list[str] = []
+    for k, v in updates.items():
+        fm[k] = v
+        set_keys.append(k)
+    removed_keys: list[str] = []
+    for k in remove:
+        if k in fm:
+            del fm[k]
+            removed_keys.append(k)
+
+    new_raw = serialize_frontmatter(fm, body)
+    if new_raw == raw:
+        return f"No changes for {path}"
+
+    try:
+        write_file(path, new_raw)
+    except ValueError as e:
+        return str(e)
+
+    summary: list[str] = []
+    if set_keys:
+        summary.append(f"set: {', '.join(set_keys)}")
+    if removed_keys:
+        summary.append(f"removed: {', '.join(removed_keys)}")
+    if not summary:
+        summary.append("no key changes (whitespace-only)")
+    return f"Updated frontmatter in {path} ({'; '.join(summary)})"

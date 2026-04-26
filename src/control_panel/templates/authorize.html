@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Authorize — Obsidian MCP</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@400;600&family=DM+Sans:opsz,wght@9..40,300;9..40,400;9..40,500&family=JetBrains+Mono:wght@400&display=swap" rel="stylesheet">
+    <style>
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+        body {
+            background: #070910;
+            color: #d8dce8;
+            font-family: 'DM Sans', sans-serif;
+            font-size: 14px;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        body::after {
+            content: '';
+            position: fixed;
+            inset: 0;
+            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='300' height='300'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.75' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='300' height='300' filter='url(%23n)' opacity='0.03'/%3E%3C/svg%3E");
+            pointer-events: none;
+            z-index: 9999;
+        }
+
+        /* Background glow */
+        body::before {
+            content: '';
+            position: fixed;
+            top: 50%; left: 50%;
+            transform: translate(-50%, -50%);
+            width: 600px;
+            height: 600px;
+            background: radial-gradient(ellipse, rgba(139,111,223,0.07) 0%, transparent 70%);
+            pointer-events: none;
+        }
+
+        .card {
+            background: #0c1018;
+            border: 1px solid #1a2336;
+            border-radius: 12px;
+            width: 100%;
+            max-width: 400px;
+            overflow: hidden;
+            box-shadow: 0 32px 80px rgba(0,0,0,0.7);
+            animation: in 0.3s ease;
+            position: relative;
+        }
+
+        @keyframes in {
+            from { opacity: 0; transform: translateY(12px); }
+            to   { opacity: 1; transform: translateY(0); }
+        }
+
+        /* Top border gradient */
+        .card::before {
+            content: '';
+            position: absolute;
+            top: 0; left: 0; right: 0;
+            height: 1px;
+            background: linear-gradient(90deg, transparent 0%, #5a45a8 40%, transparent 100%);
+        }
+
+        .card-top {
+            padding: 28px 28px 20px;
+            border-bottom: 1px solid #1a2336;
+            display: flex;
+            align-items: center;
+            gap: 14px;
+        }
+
+        .gem {
+            width: 28px;
+            height: 28px;
+            flex-shrink: 0;
+            animation: glow 4s ease-in-out infinite;
+        }
+
+        @keyframes glow {
+            0%, 100% { filter: drop-shadow(0 0 4px rgba(139,111,223,0.55)); }
+            50%       { filter: drop-shadow(0 0 10px rgba(139,111,223,0.9)); }
+        }
+
+        .wordmark {
+            font-family: 'Cormorant Garamond', serif;
+            font-size: 20px;
+            font-weight: 600;
+            color: #d8dce8;
+            letter-spacing: 0.02em;
+        }
+
+        .card-body { padding: 24px 28px; }
+
+        .request-box {
+            background: rgba(139,111,223,0.07);
+            border: 1px solid rgba(139,111,223,0.18);
+            border-radius: 7px;
+            padding: 14px 16px;
+            margin-bottom: 22px;
+            font-size: 13px;
+            color: #9fa8b8;
+            line-height: 1.5;
+        }
+
+        .request-box strong { color: #d8dce8; font-weight: 500; }
+
+        .scope-label {
+            font-size: 10px;
+            font-weight: 600;
+            letter-spacing: 0.14em;
+            text-transform: uppercase;
+            color: #364155;
+            margin-bottom: 10px;
+        }
+
+        .scope-option {
+            display: flex;
+            align-items: flex-start;
+            gap: 12px;
+            padding: 12px 14px;
+            border-radius: 6px;
+            border: 1px solid #1a2336;
+            margin-bottom: 8px;
+            cursor: pointer;
+            transition: border-color 0.15s, background 0.15s;
+        }
+
+        .scope-option:hover {
+            border-color: #223050;
+            background: rgba(139,111,223,0.04);
+        }
+
+        .scope-option input[type="radio"] {
+            margin-top: 3px;
+            accent-color: #8b6fdf;
+            flex-shrink: 0;
+        }
+
+        .scope-option-title {
+            font-size: 13px;
+            font-weight: 500;
+            color: #d8dce8;
+            margin-bottom: 2px;
+        }
+
+        .scope-option-desc {
+            font-size: 11.5px;
+            color: #6e7e9c;
+            line-height: 1.4;
+        }
+
+        .actions {
+            display: flex;
+            gap: 10px;
+            margin-top: 24px;
+        }
+
+        .btn-approve {
+            flex: 1;
+            padding: 10px;
+            background: #5a45a8;
+            color: #e0d9f8;
+            border: none;
+            border-radius: 6px;
+            font-family: 'DM Sans', sans-serif;
+            font-size: 13px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: background 0.15s, box-shadow 0.15s;
+        }
+
+        .btn-approve:hover {
+            background: #8b6fdf;
+            box-shadow: 0 0 20px rgba(139,111,223,0.3);
+        }
+
+        .btn-deny {
+            flex: 1;
+            padding: 10px;
+            background: rgba(110,126,156,0.1);
+            color: #6e7e9c;
+            border: 1px solid #1a2336;
+            border-radius: 6px;
+            font-family: 'DM Sans', sans-serif;
+            font-size: 13px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: color 0.15s, background 0.15s;
+        }
+
+        .btn-deny:hover {
+            color: #d8dce8;
+            background: rgba(110,126,156,0.18);
+        }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <div class="card-top">
+            <svg class="gem" viewBox="0 0 28 28" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <polygon points="14,2 24,9 22,22 6,22 4,9" fill="none" stroke="#8b6fdf" stroke-width="1.4"/>
+                <polygon points="14,2 24,9 14,7" fill="rgba(139,111,223,0.18)" stroke="none"/>
+                <polygon points="14,7 24,9 22,22 6,22 4,9" fill="rgba(139,111,223,0.05)" stroke="none"/>
+                <line x1="14" y1="2" x2="14" y2="7" stroke="#8b6fdf" stroke-width="0.8" opacity="0.7"/>
+                <line x1="14" y1="7" x2="4" y2="9"  stroke="#8b6fdf" stroke-width="0.5" opacity="0.4"/>
+                <line x1="14" y1="7" x2="24" y2="9" stroke="#8b6fdf" stroke-width="0.5" opacity="0.4"/>
+            </svg>
+            <div>
+                <div class="wordmark">Obsidian MCP</div>
+                <div style="font-size:10px;font-weight:600;letter-spacing:0.16em;text-transform:uppercase;color:#364155;margin-top:3px;">Authorization Request</div>
+            </div>
+        </div>
+
+        <div class="card-body">
+            <div class="request-box">
+                <strong>{{ client_name }}</strong> is requesting access to your Obsidian vault.
+            </div>
+
+            <form method="post" action="/authorize">
+                <input type="hidden" name="client_id"             value="{{ client_id }}">
+                <input type="hidden" name="redirect_uri"          value="{{ redirect_uri }}">
+                <input type="hidden" name="code_challenge"        value="{{ code_challenge }}">
+                <input type="hidden" name="code_challenge_method" value="{{ code_challenge_method }}">
+                <input type="hidden" name="state"                 value="{{ state }}">
+                <input type="hidden" name="client_state"          value="{{ client_state }}">
+
+                <div class="scope-label">Grant access level</div>
+
+                <label class="scope-option">
+                    <input type="radio" name="scope" value="read" checked>
+                    <div>
+                        <div class="scope-option-title">Read only</div>
+                        <div class="scope-option-desc">Search and read notes. Cannot create or edit.</div>
+                    </div>
+                </label>
+
+                <label class="scope-option">
+                    <input type="radio" name="scope" value="readwrite">
+                    <div>
+                        <div class="scope-option-title">Read + Write</div>
+                        <div class="scope-option-desc">Full access: search, read, create, and edit notes.</div>
+                    </div>
+                </label>
+
+                <div class="actions">
+                    <button type="submit" name="action" value="approve" class="btn-approve">Approve</button>
+                    <button type="submit" name="action" value="deny"    class="btn-deny">Deny</button>
+                </div>
+            </form>
+        </div>
+    </div>
+</body>
+</html>

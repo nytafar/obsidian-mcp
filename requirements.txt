@@ -1,0 +1,37 @@
+# Core
+fastapi==0.135.1
+uvicorn[standard]==0.42.0
+python-multipart==0.0.22
+
+# Database
+sqlalchemy[asyncio]==2.0.48
+asyncpg==0.31.0
+alembic==1.18.4
+pgvector==0.4.2
+
+# MCP
+mcp[cli]==1.26.0
+
+# Embeddings & search
+httpx==0.28.1
+
+# YAML parsing
+pyyaml==6.0.3
+
+# Settings
+pydantic-settings==2.13.1
+
+# Templates
+jinja2==3.1.6
+
+# Security
+itsdangerous==2.2.0
+
+# Rate limiting (Phase 8)
+slowapi==0.1.9
+
+# Dev/audit
+pip-audit  # dev/audit
+
+# File watching (Phase 6)
+# watchfiles==1.0.5

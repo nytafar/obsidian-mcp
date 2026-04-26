@@ -1,0 +1,136 @@
+import hashlib
+import logging
+import time
+from contextvars import ContextVar
+from datetime import datetime, timezone
+
+from sqlalchemy import select, update
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+from starlette.types import ASGIApp, Receive, Scope, Send
+
+from src.database import async_session
+from src.models.db import APIKey, OAuthToken
+
+logger = logging.getLogger(__name__)
+
+# Context variables for current request's auth state
+current_permission: ContextVar[str] = ContextVar("current_permission", default="read")
+current_api_key_id: ContextVar[int | None] = ContextVar("current_api_key_id", default=None)
+
+
+def hash_key(key: str) -> str:
+    return hashlib.sha256(key.encode()).hexdigest()
+
+
+class APIKeyMiddleware:
+    """ASGI middleware that authenticates requests via Bearer token against api_keys table."""
+
+    def __init__(self, app: ASGIApp):
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send):
+        if scope["type"] not in ("http", "websocket"):
+            await self.app(scope, receive, send)
+            return
+
+        request = Request(scope)
+        auth_header = request.headers.get("authorization", "")
+
+        if not auth_header.startswith("Bearer "):
+            response = JSONResponse({"error": "Missing Bearer token"}, status_code=401)
+            await response(scope, receive, send)
+            return
+
+        token = auth_header[7:]
+
+        # Set default ContextVar values and capture reset tokens for cleanup
+        token_perm = current_permission.set("read")
+        token_key = current_api_key_id.set(None)
+
+        try:
+            if token.startswith("omcp_"):
+                # Legacy API key auth
+                key_hash = hash_key(token)
+
+                async with async_session() as session:
+                    result = await session.execute(
+                        select(APIKey).where(
+                            APIKey.key_hash == key_hash,
+                            APIKey.is_active == True,
+                        )
+                    )
+                    api_key = result.scalar_one_or_none()
+
+                    if api_key is None:
+                        logger.warning("auth_failure", extra={"reason": "invalid_key", "key_prefix": token[:8]})
+                        response = JSONResponse({"error": "Invalid or revoked key"}, status_code=401)
+                        await response(scope, receive, send)
+                        return
+
+                    # Check expiry
+                    if api_key.expires_at and api_key.expires_at < datetime.now(timezone.utc):
+                        logger.warning("auth_failure", extra={"reason": "key_expired", "key_id": api_key.id})
+                        response = JSONResponse({"error": "Key expired"}, status_code=401)
+                        await response(scope, receive, send)
+                        return
+
+                    # Update last_used_at
+                    await session.execute(
+                        update(APIKey).where(APIKey.id == api_key.id).values(
+                            last_used_at=datetime.now(timezone.utc)
+                        )
+                    )
+                    await session.commit()
+
+                    # Store key info in scope for tools to access
+                    scope["state"] = scope.get("state", {})
+                    scope["state"]["api_key_id"] = api_key.id
+                    scope["state"]["api_key_permission"] = api_key.permission
+                    scope["state"]["request_start"] = time.time()
+
+                    # Set context variables so tools can check permission and log usage
+                    current_permission.set(api_key.permission)
+                    current_api_key_id.set(api_key.id)
+            else:
+                # OAuth token auth
+                token_hash = hash_key(token)
+
+                async with async_session() as session:
+                    result = await session.execute(
+                        select(OAuthToken).where(
+                            OAuthToken.token_hash == token_hash,
+                            OAuthToken.token_type == "access",
+                            OAuthToken.revoked == False,
+                        )
+                    )
+                    oauth_token = result.scalar_one_or_none()
+
+                    if oauth_token is None:
+                        logger.warning("auth_failure", extra={"reason": "invalid_key", "key_prefix": token[:8]})
+                        response = JSONResponse({"error": "Invalid or revoked token"}, status_code=401)
+                        await response(scope, receive, send)
+                        return
+
+                    if oauth_token.expires_at < datetime.now(timezone.utc):
+                        logger.warning("auth_failure", extra={"reason": "key_expired", "key_id": oauth_token.id})
+                        response = JSONResponse({"error": "Token expired"}, status_code=401)
+                        await response(scope, receive, send)
+                        return
+
+                    # Map OAuth scope to permission - scopes are space-separated (OAuth 2.0 convention)
+                    scope_parts = set(oauth_token.scope.split())
+                    permission = "readwrite" if "readwrite" in scope_parts else "read"
+
+                    scope["state"] = scope.get("state", {})
+                    scope["state"]["api_key_id"] = None
+                    scope["state"]["api_key_permission"] = permission
+                    scope["state"]["request_start"] = time.time()
+
+                    current_permission.set(permission)
+                    current_api_key_id.set(None)
+
+            await self.app(scope, receive, send)
+        finally:
+            current_permission.reset(token_perm)
+            current_api_key_id.reset(token_key)

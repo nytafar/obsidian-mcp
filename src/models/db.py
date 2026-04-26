@@ -1,0 +1,179 @@
+import datetime
+
+from pgvector.sqlalchemy import Vector
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    func,
+)
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB, TSVECTOR
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+
+from src.config import settings
+
+
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class APIKey(Base):
+    __tablename__ = "api_keys"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    key_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    key_prefix: Mapped[str] = mapped_column(String(12), nullable=False)
+    permission: Mapped[str] = mapped_column(String(20), nullable=False, default="read")
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    expires_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    last_used_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    usage_logs: Mapped[list["UsageLog"]] = relationship(back_populates="api_key")
+
+
+class UsageLog(Base):
+    __tablename__ = "usage_logs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    key_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("api_keys.id"), nullable=True)
+    tool: Mapped[str] = mapped_column(String(100), nullable=False)
+    params: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    response_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    api_key: Mapped["APIKey | None"] = relationship(back_populates="usage_logs")
+
+    __table_args__ = (Index("ix_usage_logs_created_at", "created_at"),)
+
+
+class NoteMetadata(Base):
+    __tablename__ = "notes_metadata"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    file_path: Mapped[str] = mapped_column(String(1024), unique=True, nullable=False)
+    title: Mapped[str] = mapped_column(String(512), nullable=False)
+    tags: Mapped[list[str] | None] = mapped_column(ARRAY(String), nullable=True)
+    frontmatter: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    embedded_content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    content_tsvector: Mapped[str | None] = mapped_column(TSVECTOR, nullable=True)
+    file_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    modified_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    indexed_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    embeddings: Mapped[list["NoteEmbedding"]] = relationship(
+        back_populates="note", cascade="all, delete-orphan"
+    )
+
+    __table_args__ = (
+        Index("ix_notes_metadata_tsvector", "content_tsvector", postgresql_using="gin"),
+        Index("ix_notes_metadata_tags", "tags", postgresql_using="gin"),
+    )
+
+
+class NoteEmbedding(Base):
+    __tablename__ = "note_embeddings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    note_id: Mapped[int] = mapped_column(Integer, ForeignKey("notes_metadata.id", ondelete="CASCADE"), nullable=False)
+    chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    chunk_text: Mapped[str] = mapped_column(Text, nullable=False)
+    embedding: Mapped[list[float]] = mapped_column(Vector(settings.embedding_dimensions), nullable=False)
+
+    note: Mapped["NoteMetadata"] = relationship(back_populates="embeddings")
+
+    __table_args__ = (
+        Index("ix_note_embeddings_note_id", "note_id"),
+    )
+
+
+class NoteLink(Base):
+    __tablename__ = "note_links"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    source_note_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("notes_metadata.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    target_note_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey("notes_metadata.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    target_path: Mapped[str] = mapped_column(String(1024), nullable=False)
+    link_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    kind: Mapped[str] = mapped_column(String(16), nullable=False, default="link")
+    position: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    __table_args__ = (
+        Index("ix_note_links_source", "source_note_id"),
+        Index("ix_note_links_target", "target_note_id"),
+        Index("ix_note_links_target_path", "target_path"),
+    )
+
+
+class OAuthClient(Base):
+    __tablename__ = "oauth_clients"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    client_id: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    client_secret_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    client_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    redirect_uris: Mapped[list] = mapped_column(JSONB, nullable=False)
+    scope: Mapped[str] = mapped_column(String(50), nullable=False, default="read")
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class OAuthCode(Base):
+    __tablename__ = "oauth_codes"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    code_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    client_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("oauth_clients.client_id", ondelete="CASCADE"), nullable=False
+    )
+    redirect_uri: Mapped[str] = mapped_column(String(2048), nullable=False)
+    scope: Mapped[str] = mapped_column(String(50), nullable=False)
+    code_challenge: Mapped[str] = mapped_column(String(128), nullable=False)
+    code_challenge_method: Mapped[str] = mapped_column(String(10), nullable=False, default="S256")
+    expires_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    used: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class OAuthToken(Base):
+    __tablename__ = "oauth_tokens"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    token_type: Mapped[str] = mapped_column(String(10), nullable=False)
+    client_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("oauth_clients.client_id", ondelete="CASCADE"), nullable=False
+    )
+    scope: Mapped[str] = mapped_column(String(50), nullable=False)
+    expires_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    revoked: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )

@@ -1,0 +1,121 @@
+{% extends "base.html" %}
+{% block title %}API Keys — Obsidian MCP{% endblock %}
+{% block content %}
+
+<div class="page-top">
+    <h1 class="page-title">API Keys</h1>
+    <div class="page-actions">
+        {% set revoked_count = keys | selectattr('is_active', 'equalto', false) | list | length %}
+        {% if revoked_count > 0 %}
+        <form method="POST" action="/admin/keys/delete-revoked" style="display:inline;">
+            <button type="submit" class="btn btn-danger" onclick="return confirm('Permanently delete all {{ revoked_count }} revoked key{{ 's' if revoked_count != 1 }}?')">
+                Delete Revoked ({{ revoked_count }})
+            </button>
+        </form>
+        {% endif %}
+        <button onclick="document.getElementById('create-modal').classList.add('open')" class="btn btn-primary">
+            <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+                <line x1="6" y1="1" x2="6" y2="11"/><line x1="1" y1="6" x2="11" y2="6"/>
+            </svg>
+            New Key
+        </button>
+    </div>
+</div>
+
+<div class="page-body">
+
+    {% if new_key %}
+    <div class="alert alert-success anim-1">
+        <div style="font-size:11px;font-weight:600;letter-spacing:0.1em;text-transform:uppercase;margin-bottom:10px;opacity:0.75;">New key created — copy now, won't be shown again</div>
+        <div style="display:flex;align-items:center;gap:10px;">
+            <code id="new-key-val" class="mono" style="flex:1;background:rgba(0,0,0,0.3);padding:10px 14px;border-radius:5px;font-size:12px;word-break:break-all;color:#a0f0cc;">{{ new_key }}</code>
+            <button onclick="navigator.clipboard.writeText(document.getElementById('new-key-val').textContent).then(()=>{this.textContent='Copied!';setTimeout(()=>this.textContent='Copy',2000);})" class="btn btn-ghost" style="flex-shrink:0;">Copy</button>
+        </div>
+    </div>
+    {% endif %}
+
+    <div class="card anim-1">
+        <div class="table-scroll">
+        <table class="data-table">
+            <thead>
+                <tr>
+                    <th>Name</th>
+                    <th>Prefix</th>
+                    <th>Permission</th>
+                    <th>Status</th>
+                    <th>Last Used</th>
+                    <th>Created</th>
+                    <th></th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for key in keys %}
+                <tr>
+                    <td style="color:var(--text);font-weight:500;">{{ key.name }}</td>
+                    <td class="mono" style="color:var(--text-2);">{{ key.key_prefix }}···</td>
+                    <td>
+                        {% if key.permission == 'readwrite' %}
+                        <span class="badge badge-yellow">readwrite</span>
+                        {% else %}
+                        <span class="badge badge-blue">read</span>
+                        {% endif %}
+                    </td>
+                    <td>
+                        {% if key.is_active %}
+                        <span class="badge badge-green">Active</span>
+                        {% else %}
+                        <span class="badge badge-red">Revoked</span>
+                        {% endif %}
+                    </td>
+                    <td class="mono" style="font-size:11px;color:var(--text-2);">{{ key.last_used_at or '—' }}</td>
+                    <td class="mono" style="font-size:11px;color:var(--text-2);">{{ key.created_at }}</td>
+                    <td style="white-space:nowrap;">
+                        {% if key.is_active %}
+                        <form method="POST" action="/admin/keys/{{ key.id }}/revoke" style="display:inline;">
+                            <button type="submit" class="btn btn-link" onclick="return confirm('Revoke this key?')">Revoke</button>
+                        </form>
+                        {% else %}
+                        <form method="POST" action="/admin/keys/{{ key.id }}/delete" style="display:inline;">
+                            <button type="submit" class="btn btn-link" onclick="return confirm('Permanently delete this key?')">Delete</button>
+                        </form>
+                        {% endif %}
+                    </td>
+                </tr>
+                {% endfor %}
+                {% if not keys %}
+                <tr>
+                    <td colspan="7" style="text-align:center;padding:32px;color:var(--text-3);">No API keys yet.</td>
+                </tr>
+                {% endif %}
+            </tbody>
+        </table>
+        </div>
+    </div>
+
+</div>
+
+<!-- Create modal -->
+<div id="create-modal" class="modal">
+    <div class="modal-panel">
+        <div class="modal-title">Create API Key</div>
+        <form method="POST" action="/admin/keys/create">
+            <div class="field">
+                <label class="field-label">Name</label>
+                <input type="text" name="name" required class="field-input" placeholder="e.g. Claude Desktop">
+            </div>
+            <div class="field">
+                <label class="field-label">Permission</label>
+                <select name="permission" class="field-select">
+                    <option value="read">Read only</option>
+                    <option value="readwrite">Read + Write</option>
+                </select>
+            </div>
+            <div class="modal-footer">
+                <button type="button" onclick="document.getElementById('create-modal').classList.remove('open')" class="btn btn-ghost">Cancel</button>
+                <button type="submit" class="btn btn-primary">Create</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+{% endblock %}

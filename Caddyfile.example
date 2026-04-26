@@ -1,0 +1,59 @@
+# Caddyfile for the simple deployment.
+# Caddy auto-issues Let's Encrypt certs from {$MCP_HOSTNAME}, terminates TLS,
+# and proxies to the MCP container on port 8000.
+
+{$MCP_HOSTNAME} {
+    encode gzip
+
+    # ── Public MCP endpoint (API-key auth at the application layer) ──
+    @mcp {
+        path /mcp* /health /.well-known* /register /token /revoke
+    }
+    handle @mcp {
+        reverse_proxy obsidian-mcp:8000
+    }
+
+    # ── Root MCP fallback for clients that strip the /mcp prefix ──
+    @rootMcp {
+        method POST GET DELETE
+        path /
+        header Authorization Bearer*
+    }
+    handle @rootMcp {
+        reverse_proxy obsidian-mcp:8000
+    }
+
+    # ── Admin panel + REST API ──
+    # Uncomment ONE of the auth blocks below before going live.
+    @admin {
+        path /admin* /api* /authorize
+    }
+    handle @admin {
+        # ── Option 1: Caddy basic auth ──
+        # Generate hash: docker run --rm caddy:2 caddy hash-password --plaintext 'YOUR_PASSWORD'
+        # basic_auth {
+        #     youruser $2a$14$REPLACE_WITH_BCRYPT_HASH
+        # }
+
+        # ── Option 2: IP allowlist ──
+        # @trusted {
+        #     remote_ip 1.2.3.4 5.6.7.8/32
+        # }
+        # @untrusted {
+        #     not remote_ip 1.2.3.4 5.6.7.8/32
+        # }
+        # respond @untrusted "Forbidden" 403
+
+        reverse_proxy obsidian-mcp:8000
+    }
+
+    # ── Default: deny everything else ──
+    respond "Not found" 404
+
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        -Server
+    }
+}

@@ -1,0 +1,80 @@
+# Reference deployment for a Traefik-fronted homelab setup.
+#
+# To adapt to your environment, set in `.env`:
+#   MCP_HOSTNAME       -- public hostname Traefik routes to
+#   VAULT_HOST_PATH    -- host path to your Obsidian vault
+#   BACKUPS_HOST_PATH  -- host path for database backups (optional)
+#
+# The Traefik labels assume an external `t2_proxy` network and a
+# `chain-oauth@file` middleware; adjust the network/middleware names
+# (or strip them) for your reverse-proxy setup.
+
+networks:
+  t2_proxy:
+    external: true
+
+services:
+  obsidian-mcp:
+    image: localhost:5000/obsidian-mcp:latest
+    pull_policy: always
+    container_name: obsidian-mcp
+    restart: unless-stopped
+    hostname: obsidian-mcp
+    networks:
+      - t2_proxy
+    security_opt:
+      - no-new-privileges:true
+      - apparmor=docker-default
+    cap_drop:
+      - ALL
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+        reservations:
+          memory: 512M
+    env_file:
+      - .env
+    volumes:
+      - ${VAULT_HOST_PATH:-./vault}:/obsidian
+      - ${BACKUPS_HOST_PATH:-./backups}:/app/backups
+      - /etc/timezone:/etc/timezone:ro
+      - /etc/localtime:/etc/localtime:ro
+    labels:
+      - "traefik.enable=true"
+      # Panel + authorize router (OAuth protected)
+      - "traefik.http.routers.obsidian-mcp-panel-rtr.entrypoints=https"
+      - "traefik.http.routers.obsidian-mcp-panel-rtr.rule=Host(`${MCP_HOSTNAME:-obsidian-mcp.localhost}`) && (PathPrefix(`/admin`) || Path(`/authorize`))"
+      - "traefik.http.routers.obsidian-mcp-panel-rtr.tls=true"
+      - "traefik.http.routers.obsidian-mcp-panel-rtr.tls.certresolver=dns-namecheap"
+      - "traefik.http.routers.obsidian-mcp-panel-rtr.middlewares=chain-oauth@file"
+      - "traefik.http.routers.obsidian-mcp-panel-rtr.service=obsidian-mcp-svc"
+      # API/MCP/OAuth public router (no OAuth — app-level auth)
+      - "traefik.http.routers.obsidian-mcp-api-rtr.entrypoints=https"
+      - "traefik.http.routers.obsidian-mcp-api-rtr.rule=Host(`${MCP_HOSTNAME:-obsidian-mcp.localhost}`) && (PathPrefix(`/mcp`) || Path(`/health`) || PathPrefix(`/.well-known`) || Path(`/register`) || Path(`/token`) || Path(`/revoke`))"
+      - "traefik.http.routers.obsidian-mcp-api-rtr.tls=true"
+      - "traefik.http.routers.obsidian-mcp-api-rtr.tls.certresolver=dns-namecheap"
+      - "traefik.http.routers.obsidian-mcp-api-rtr.service=obsidian-mcp-svc"
+      # REST API router (OAuth protected)
+      - "traefik.http.routers.obsidian-mcp-apirest-rtr.entrypoints=https"
+      - "traefik.http.routers.obsidian-mcp-apirest-rtr.rule=Host(`${MCP_HOSTNAME:-obsidian-mcp.localhost}`) && PathPrefix(`/api`)"
+      - "traefik.http.routers.obsidian-mcp-apirest-rtr.tls=true"
+      - "traefik.http.routers.obsidian-mcp-apirest-rtr.tls.certresolver=dns-namecheap"
+      - "traefik.http.routers.obsidian-mcp-apirest-rtr.middlewares=chain-oauth@file"
+      - "traefik.http.routers.obsidian-mcp-apirest-rtr.service=obsidian-mcp-svc"
+      # Root MCP router — bypass OAuth when any Bearer header present (priority=100)
+      - "traefik.http.routers.obsidian-mcp-root-rtr.entrypoints=https"
+      - "traefik.http.routers.obsidian-mcp-root-rtr.rule=Host(`${MCP_HOSTNAME:-obsidian-mcp.localhost}`) && HeaderRegexp(`Authorization`, `^Bearer `)"
+      - "traefik.http.routers.obsidian-mcp-root-rtr.tls=true"
+      - "traefik.http.routers.obsidian-mcp-root-rtr.tls.certresolver=dns-namecheap"
+      - "traefik.http.routers.obsidian-mcp-root-rtr.priority=100"
+      - "traefik.http.routers.obsidian-mcp-root-rtr.service=obsidian-mcp-svc"
+      # Shared service
+      - "traefik.http.services.obsidian-mcp-svc.loadbalancer.server.port=8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s

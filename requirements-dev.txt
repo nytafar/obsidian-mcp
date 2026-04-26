@@ -1,0 +1,6 @@
+# Test deps — installed in the container or local virtualenv for dev work.
+# Production image (`requirements.txt`) does not include these.
+-r requirements.txt
+pytest==8.4.0
+pytest-asyncio==1.0.0
+respx==0.22.0

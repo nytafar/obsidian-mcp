@@ -1,0 +1,397 @@
+from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
+
+from src.config import settings
+from src.mcp_server.tools import (
+    create_note_impl,
+    delete_note_impl,
+    edit_note_impl,
+    find_orphans_impl,
+    find_related_impl,
+    get_backlinks_impl,
+    get_links_impl,
+    get_neighborhood_impl,
+    get_recent_impl,
+    get_tags_impl,
+    get_vault_guide_impl,
+    list_notes_impl,
+    move_note_impl,
+    read_note_impl,
+    search_notes_impl,
+    semantic_search_impl,
+    set_frontmatter_impl,
+)
+
+mcp = FastMCP(
+    "obsidian-vault",
+    stateless_http=True,
+    streamable_http_path="/",
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=settings.allowed_hosts,
+    ),
+)
+
+
+@mcp.tool()
+async def keyword_search(
+    query: str,
+    folder: str | None = None,
+    limit: int = 20,
+    tags: list[str] | None = None,
+    frontmatter: dict | None = None,
+) -> str:
+    """Full-text keyword search via PostgreSQL tsvector. Use this for exact identifiers,
+    code symbols, proper nouns, or known phrases — anywhere semantic noise hurts.
+
+    For conceptual or paraphrased queries, use semantic_search instead.
+
+    Args:
+        query: Keywords or phrase to match (websearch tsquery syntax: "foo bar", "foo OR bar", "-bar").
+        folder: Optional folder prefix (e.g. "Cards/", "Projects/").
+        limit: Maximum number of results (default 20).
+        tags: Optional list of tag names; only notes carrying ALL listed tags match
+            (e.g. ["project", "active"]).
+        frontmatter: Optional dict of frontmatter key/value pairs; only notes whose JSONB
+            frontmatter contains every pair match. Strict type matching — string "0" does
+            not match integer 0 (e.g. {"status": "draft"}).
+    """
+    return await search_notes_impl(
+        query, folder=folder, limit=limit, tags=tags, frontmatter=frontmatter
+    )
+
+
+@mcp.tool()
+async def read_note(path: str) -> str:
+    """Read a note from the Obsidian vault by its relative path.
+
+    Args:
+        path: Vault-relative path to the note (e.g. "Cards/My Note.md")
+    """
+    return await read_note_impl(path)
+
+
+@mcp.tool()
+async def list_notes(
+    folder: str = "",
+    limit: int = 50,
+    tags: list[str] | None = None,
+    frontmatter: dict | None = None,
+) -> str:
+    """List notes in a vault folder, sorted by most recently modified.
+
+    Results come from the index, so a note that exists on disk but has not yet been
+    picked up by the indexer will not appear (lag is bounded by the index interval,
+    typically up to 5 minutes).
+
+    Args:
+        folder: Vault-relative folder path (e.g. "Cards/", "Projects/"). Empty for vault root.
+        limit: Maximum number of results (default 50).
+        tags: Optional list of tag names; only notes carrying ALL listed tags match
+            (e.g. ["idea"]).
+        frontmatter: Optional dict of frontmatter key/value pairs; strict type match
+            (e.g. {"status": "active"}).
+    """
+    return await list_notes_impl(folder, limit=limit, tags=tags, frontmatter=frontmatter)
+
+
+@mcp.tool()
+async def get_tags(limit: int = 50) -> str:
+    """List all tags used across the vault with note counts.
+
+    Args:
+        limit: Maximum number of tags to return (default 50)
+    """
+    return await get_tags_impl(limit=limit)
+
+
+@mcp.tool()
+async def get_recent(
+    limit: int = 20,
+    folder: str | None = None,
+    tags: list[str] | None = None,
+    frontmatter: dict | None = None,
+) -> str:
+    """Get recently modified notes.
+
+    Args:
+        limit: Number of recent notes to return (default 20).
+        folder: Optional folder prefix to filter (e.g. "Projects/").
+        tags: Optional list of tag names; only notes carrying ALL listed tags match
+            (e.g. ["meeting"]).
+        frontmatter: Optional dict of frontmatter key/value pairs; strict type match
+            (e.g. {"status": "active"}).
+    """
+    return await get_recent_impl(
+        limit=limit, folder=folder, tags=tags, frontmatter=frontmatter
+    )
+
+
+@mcp.tool()
+async def semantic_search(
+    query: str,
+    limit: int = 20,
+    folder: str | None = None,
+    tags: list[str] | None = None,
+    frontmatter: dict | None = None,
+) -> str:
+    """Vector similarity search using bge-m3 embeddings. Use this for conceptual or paraphrased
+    queries — anywhere exact word matching would miss the point.
+
+    For exact identifiers, code symbols, proper nouns, or known phrases, use keyword_search instead.
+
+    Args:
+        query: Natural language description of what you're looking for.
+        limit: Maximum number of results (default 20).
+        folder: Optional folder prefix (e.g. "Projects/").
+        tags: Optional list of tag names; only notes carrying ALL listed tags match
+            (e.g. ["product"]).
+        frontmatter: Optional dict of frontmatter key/value pairs; strict type matching —
+            string "0" does not match integer 0 (e.g. {"status": "active"}).
+    """
+    return await semantic_search_impl(
+        query, limit=limit, folder=folder, tags=tags, frontmatter=frontmatter
+    )
+
+
+@mcp.tool()
+async def create_note(path: str, content: str) -> str:
+    """Create a new markdown note in the Obsidian vault. Requires a readwrite API key.
+
+    See `get_vault_guide` for Obsidian syntax and any vault-specific conventions
+    (naming, folder placement, frontmatter, tags).
+
+    Args:
+        path: Vault-relative path for the new note (e.g. "Cards/New Topic.md"). The .md extension is added if missing.
+        content: Full markdown content for the note, including any frontmatter.
+    """
+    return await create_note_impl(path, content)
+
+
+@mcp.tool()
+async def edit_note(
+    path: str,
+    content: str,
+    append: bool = False,
+    find: str | None = None,
+    section: str | None = None,
+    replace_all: bool = False,
+    dry_run: bool = False,
+) -> str:
+    """Edit an existing note in the Obsidian vault. Requires a readwrite API key.
+
+    See `get_vault_guide` for Obsidian syntax and any vault-specific conventions
+    (naming, folder placement, frontmatter, tags).
+
+    Four mutually exclusive modes (set at most one of append/find/section):
+    1. **Full replace** (default): provide only `content`; the entire file is overwritten.
+    2. **Append**: `append=True`; `content` is added at the end (preceded by a single newline).
+    3. **Find & replace**: `find=<exact text>`; replaced with `content`. Must match
+       exactly once unless `replace_all=True`.
+    4. **Section**: `section=<heading>`; replaces the body under the named ATX heading.
+       Use the path-style form `Parent/Child` to disambiguate when the same heading
+       appears more than once. Setext (`====`/`----`) headings are not matched.
+
+    Flags:
+    - `replace_all=True`: with `find`, replace every occurrence rather than failing on
+      multiple matches. Ignored when `find` is unset.
+    - `dry_run=True`: compute the would-be result and return a unified diff without
+      writing. Works for all four modes.
+
+    Writes are atomic (tmp file + os.replace) so a crash mid-write cannot truncate
+    the destination. Frontmatter mutation is better done via `set_frontmatter` —
+    PyYAML serialization there discards YAML comments.
+
+    Args:
+        path: Vault-relative path to the note.
+        content: New full content, replacement text, text to append, or section body.
+        append: If True, append content to the end of the note.
+        find: Exact text to find and replace.
+        section: ATX heading text identifying the section whose body to replace.
+            Use `Parent/Child` to disambiguate repeated headings.
+        replace_all: With `find`, replace every match instead of requiring uniqueness.
+        dry_run: Return a unified diff and do not write.
+    """
+    return await edit_note_impl(
+        path,
+        content,
+        append=append,
+        find=find,
+        section=section,
+        replace_all=replace_all,
+        dry_run=dry_run,
+    )
+
+
+@mcp.tool()
+async def get_vault_guide() -> str:
+    """Returns a two-part guide for working with this Obsidian vault:
+
+    1. **Obsidian primer** — generic syntax (wikilinks, embeds, block refs,
+       heading refs, tags, frontmatter, callouts, comments, highlights,
+       math, mermaid, footnotes, tasks, plugin literals).
+    2. **Vault-specific conventions** — folder structure, naming rules,
+       frontmatter requirements, and tag taxonomy as configured by the
+       vault owner in `CLAUDE.md`. If `CLAUDE.md` is absent, the response
+       includes instructions for creating one.
+    """
+    return await get_vault_guide_impl()
+
+
+@mcp.tool()
+async def get_backlinks(path: str, limit: int = 50) -> str:
+    """Notes that link TO `path`. Use this to discover what references a given
+    note — projects citing a card, daily notes mentioning a person, etc.
+
+    Resolved links only (dangling references are not counted as backlinks).
+
+    Args:
+        path: Vault-relative path to the target note (e.g. "Cards/Foo.md").
+        limit: Maximum results (default 50, hard cap 500).
+    """
+    return await get_backlinks_impl(path, limit=limit)
+
+
+@mcp.tool()
+async def get_links(path: str) -> str:
+    """Outgoing links from `path` — both resolved and dangling.
+
+    Useful for "what does this note depend on?" or finding broken references
+    that need follow-up notes.
+
+    Args:
+        path: Vault-relative path to the source note.
+    """
+    return await get_links_impl(path)
+
+
+@mcp.tool()
+async def get_neighborhood(path: str, depth: int = 1, limit: int = 50) -> str:
+    """The connected subgraph reachable from `path` via links or backlinks,
+    up to `depth` hops (treated as undirected).
+
+    Use this when an agent needs the local cluster around a topic — e.g.
+    "summarize everything connected to this project". Prefer this over
+    `find_related` when explicit links are the signal you want; prefer
+    `find_related` when the connection is conceptual rather than linked.
+
+    Args:
+        path: Vault-relative path to the seed note.
+        depth: Maximum BFS depth (default 1, capped at 5).
+        limit: Maximum distinct neighbor notes (default 50, hard cap 200).
+    """
+    return await get_neighborhood_impl(path, depth=depth, limit=limit)
+
+
+@mcp.tool()
+async def find_related(path: str, limit: int = 10) -> str:
+    """Semantically similar notes based on the source note's chunk embeddings,
+    averaged then queried via pgvector.
+
+    Independent of the link graph — useful when the source is sparsely linked
+    or when looking for thematic neighbors. For link-based exploration use
+    `get_neighborhood`. For arbitrary topic queries use `semantic_search`.
+
+    Args:
+        path: Vault-relative path to the source note.
+        limit: Maximum results (default 10, hard cap 50).
+    """
+    return await find_related_impl(path, limit=limit)
+
+
+@mcp.tool()
+async def find_orphans(folder: str | None = None, limit: int = 50) -> str:
+    """Notes with zero incoming AND zero outgoing resolved links — useful for
+    vault hygiene ("what's disconnected?") and cleanup decisions.
+
+    Args:
+        folder: Optional vault-relative folder prefix to scope the search
+            (e.g. "Cards/").
+        limit: Maximum results (default 50, hard cap 500).
+    """
+    return await find_orphans_impl(folder=folder, limit=limit)
+
+
+@mcp.tool()
+async def move_note(
+    from_path: str, to_path: str, rewrite_links: bool = False
+) -> str:
+    """Move or rename a note inside the vault. Requires a readwrite API key.
+
+    Updates `notes_metadata.file_path` for the moved note and `note_links.target_path`
+    rows whose stored target matched the old path. Backlinks via `target_note_id`
+    keep working without rewriting source notes (the moved note's id is unchanged).
+
+    With `rewrite_links=True`, also opens every source note that linked to this
+    note and rewrites the link title in-place: `[[Old]]` → `[[New]]`,
+    `[[Old|alias]]` → `[[New|alias]]`, `[[Old#anchor]]` → `[[New#anchor]]`,
+    `![[Old]]` → `![[New]]`, and path-style `[[folder/Old]]` → `[[new/folder/New]]`.
+    Aliases and anchors are preserved; only the title portion is rewritten.
+
+    Writes are atomic. See `get_vault_guide` for vault folder conventions.
+
+    Args:
+        from_path: Vault-relative path of the existing note.
+        to_path: Vault-relative path of the destination. Must not exist. Parent
+            directories are created automatically.
+        rewrite_links: If True, also rewrite incoming wikilinks and embeds in
+            source notes. Off by default — opting in is destructive (it modifies
+            other notes' bodies).
+    """
+    return await move_note_impl(
+        from_path, to_path, rewrite_links=rewrite_links
+    )
+
+
+@mcp.tool()
+async def delete_note(path: str, permanent: bool = False) -> str:
+    """Delete a note from the vault. Requires a readwrite API key.
+
+    By default this is a soft-delete: the file is moved to
+    `.trash/<YYYYMMDD-HHMMSS>-<basename>` inside the vault root. The indexer
+    skips dot-prefixed directories, so search and embeddings drop the note
+    automatically on the next reindex pass (≤ 5 minutes). Soft-deleted files
+    accumulate in `.trash/` — emptying that directory is the user's
+    responsibility.
+
+    With `permanent=True`, the file is `os.unlink`-ed directly with no
+    recovery path inside this server. Existing backups are the rollback story.
+
+    Dangling backlinks left behind by a delete are surfaced via
+    `get_backlinks` and `find_orphans`. See `get_vault_guide` for context.
+
+    Args:
+        path: Vault-relative path to the note.
+        permanent: If True, unlink instead of soft-deleting.
+    """
+    return await delete_note_impl(path, permanent=permanent)
+
+
+@mcp.tool()
+async def set_frontmatter(
+    path: str,
+    updates: dict | None = None,
+    remove: list[str] | None = None,
+) -> str:
+    """Mutate a note's YAML frontmatter without touching its body. Requires a
+    readwrite API key.
+
+    Parses the existing frontmatter, merges in `updates` (overwriting matching
+    keys, adding any new ones), then drops keys listed in `remove`. The note
+    body is preserved byte-for-byte. If the note has no frontmatter (no `---`
+    fence on line 1), a fresh block is prepended ahead of the unchanged body.
+
+    Re-serialization uses `yaml.safe_dump(default_flow_style=False,
+    sort_keys=False, allow_unicode=True)`. **Caveat:** PyYAML does NOT preserve
+    YAML comments — any `# comment` in the original frontmatter will be lost on
+    the first `set_frontmatter` call.
+
+    See `get_vault_guide` for vault frontmatter conventions.
+
+    Args:
+        path: Vault-relative path to the note.
+        updates: Mapping of keys to set. Use the empty dict (or omit) to skip.
+        remove: List of keys to delete from the frontmatter. Missing keys are
+            silently ignored.
+    """
+    return await set_frontmatter_impl(path, updates=updates, remove=remove)

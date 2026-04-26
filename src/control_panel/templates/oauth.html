@@ -1,0 +1,108 @@
+{% extends "base.html" %}
+{% block title %}OAuth — Obsidian MCP{% endblock %}
+{% block content %}
+
+<div class="page-top">
+    <h1 class="page-title">OAuth Clients</h1>
+</div>
+
+<div class="page-body">
+
+    {% if not clients %}
+    <div class="card anim-1" style="text-align:center;padding:48px 24px;">
+        <svg width="36" height="36" viewBox="0 0 36 36" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" style="margin:0 auto 14px;opacity:0.25;">
+            <circle cx="18" cy="18" r="15"/>
+            <ellipse cx="18" cy="18" rx="7" ry="15"/>
+            <line x1="3" y1="13" x2="33" y2="13"/>
+            <line x1="3" y1="23" x2="33" y2="23"/>
+        </svg>
+        <p style="color:var(--text-2);font-size:14px;margin-bottom:6px;">No OAuth clients registered.</p>
+        <p style="color:var(--text-3);font-size:12px;">Clients are created automatically when an app connects via OAuth.</p>
+    </div>
+    {% else %}
+
+    <div style="display:flex;flex-direction:column;gap:16px;">
+        {% for client in clients %}
+        <div class="card anim-1">
+            <div class="card-header">
+                <div>
+                    <div style="font-size:15px;font-weight:500;color:var(--text);">{{ client.client_name }}</div>
+                    <div class="mono" style="font-size:10px;color:var(--text-3);margin-top:3px;">{{ client.client_id }}</div>
+                </div>
+                <div style="display:flex;align-items:center;gap:14px;">
+                    <span style="font-size:11px;color:var(--text-3);">Registered {{ client.created_at }}</span>
+                    <form method="POST" action="/admin/oauth/{{ client.client_id }}/delete" style="display:inline;">
+                        <button type="submit" class="btn btn-danger" style="font-size:11px;padding:4px 12px;" onclick="return confirm('Delete this client and revoke all its tokens?')">Delete</button>
+                    </form>
+                </div>
+            </div>
+
+            {% if client.tokens %}
+            <div class="table-scroll">
+            <table class="data-table">
+                <thead>
+                    <tr>
+                        <th>Type</th>
+                        <th>Scope</th>
+                        <th>Status</th>
+                        <th>Expires</th>
+                        <th>Created</th>
+                        <th></th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for token in client.tokens %}
+                    <tr>
+                        <td>
+                            {% if token.token_type == 'access' %}
+                            <span class="badge badge-purple">{{ token.token_type }}</span>
+                            {% else %}
+                            <span class="badge badge-gray">{{ token.token_type }}</span>
+                            {% endif %}
+                        </td>
+                        <td>
+                            {% if token.revoked %}
+                            <span class="mono" style="font-size:11px;color:var(--text-3);">{{ token.scope }}</span>
+                            {% else %}
+                            <form method="POST" action="/admin/oauth/token/{{ token.id }}/scope" style="display:inline;">
+                                <select name="scope" onchange="this.form.submit()" class="field-select" style="width:auto;padding:3px 28px 3px 8px;font-size:11px;">
+                                    <option value="read"      {% if token.scope == 'read'      %}selected{% endif %}>read</option>
+                                    <option value="readwrite" {% if token.scope == 'readwrite' %}selected{% endif %}>readwrite</option>
+                                </select>
+                            </form>
+                            {% endif %}
+                        </td>
+                        <td>
+                            {% if token.revoked %}
+                            <span class="badge badge-red">Revoked</span>
+                            {% elif token.expired %}
+                            <span class="badge badge-yellow">Expired</span>
+                            {% else %}
+                            <span class="badge badge-green">Active</span>
+                            {% endif %}
+                        </td>
+                        <td class="mono" style="font-size:11px;color:var(--text-3);">{{ token.expires_at }}</td>
+                        <td class="mono" style="font-size:11px;color:var(--text-3);">{{ token.created_at }}</td>
+                        <td>
+                            {% if not token.revoked and not token.expired %}
+                            <form method="POST" action="/admin/oauth/token/{{ token.id }}/revoke" style="display:inline;">
+                                <button type="submit" class="btn btn-link" style="font-size:11px;">Revoke</button>
+                            </form>
+                            {% endif %}
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+            </div>
+            {% else %}
+            <div style="padding:20px 22px;font-size:13px;color:var(--text-3);">No active tokens for this client.</div>
+            {% endif %}
+        </div>
+        {% endfor %}
+    </div>
+
+    {% endif %}
+
+</div>
+{% endblock %}

@@ -1,0 +1,227 @@
+import asyncio
+import logging
+import time
+from functools import lru_cache
+from typing import Protocol
+
+import httpx
+import numpy as np
+from sqlalchemy import delete, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from src.config import settings
+from src.models.db import NoteEmbedding, NoteMetadata
+from src.services.filters import apply_note_filters
+
+logger = logging.getLogger(__name__)
+
+
+def chunk_text(content: str, chunk_size: int = 500, overlap: int = 50) -> list[str]:
+    """Split text into chunks of ~chunk_size tokens with overlap.
+    Approximation: 1 token ~ 4 chars.
+    """
+    char_size = chunk_size * 4
+    char_overlap = overlap * 4
+
+    if len(content) <= char_size:
+        return [content] if content.strip() else []
+
+    chunks = []
+    start = 0
+    while start < len(content):
+        end = start + char_size
+        chunk = content[start:end]
+        if chunk.strip():
+            chunks.append(chunk.strip())
+        if end >= len(content):
+            break
+        start = end - char_overlap
+
+    return chunks
+
+
+class EmbeddingProvider(Protocol):
+    async def embed_one(self, text: str) -> list[float]: ...
+    async def embed_batch(self, texts: list[str]) -> list[list[float]]: ...
+
+
+class OllamaProvider:
+    """Default provider — POSTs to a self-hosted Ollama instance, one input
+    per request. Matches pre-change behavior exactly."""
+
+    async def embed_one(self, text: str) -> list[float]:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                f"{settings.ollama_url}/api/embed",
+                json={"model": settings.embedding_model, "input": text},
+            )
+            response.raise_for_status()
+            data = response.json()
+            return data["embeddings"][0]
+
+    async def embed_batch(
+        self, texts: list[str], batch_timeout: float = 300.0
+    ) -> list[list[float]]:
+        results: list[list[float]] = []
+        deadline = time.monotonic() + batch_timeout
+        for t in texts:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Embedding batch exceeded total timeout")
+            emb = await asyncio.wait_for(
+                self.embed_one(t), timeout=min(30.0, remaining)
+            )
+            results.append(emb)
+        return results
+
+
+class OpenAIProvider:
+    """OpenAI / OpenAI-compatible provider. Uses native batch endpoint and
+    retries 429/5xx with exponential backoff."""
+
+    OPENAI_BATCH_LIMIT = 96
+    MAX_ATTEMPTS = 3
+    BASE_DELAY = 1.0
+
+    async def _post(self, inputs: list[str]) -> list[list[float]]:
+        url = f"{settings.openai_base_url.rstrip('/')}/embeddings"
+        headers = {
+            "Authorization": f"Bearer {settings.openai_api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": settings.openai_embedding_model,
+            "input": inputs,
+            "dimensions": settings.embedding_dimensions,
+        }
+
+        last_exc: Exception | None = None
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            for attempt in range(1, self.MAX_ATTEMPTS + 1):
+                try:
+                    response = await client.post(url, headers=headers, json=payload)
+                except httpx.HTTPError as e:
+                    last_exc = e
+                    if attempt >= self.MAX_ATTEMPTS:
+                        raise
+                    await asyncio.sleep(self.BASE_DELAY * (2 ** (attempt - 1)))
+                    continue
+
+                status = response.status_code
+                if status == 200:
+                    data = response.json()
+                    rows = sorted(data["data"], key=lambda r: r["index"])
+                    return [r["embedding"] for r in rows]
+
+                retryable = status == 429 or 500 <= status < 600
+                if retryable and attempt < self.MAX_ATTEMPTS:
+                    logger.warning(
+                        "OpenAI embeddings %d on attempt %d/%d, retrying",
+                        status,
+                        attempt,
+                        self.MAX_ATTEMPTS,
+                    )
+                    await asyncio.sleep(self.BASE_DELAY * (2 ** (attempt - 1)))
+                    continue
+
+                response.raise_for_status()
+                raise RuntimeError(f"Unexpected OpenAI response: {status}")
+
+        if last_exc:
+            raise last_exc
+        raise RuntimeError("OpenAI embeddings failed without an exception")
+
+    async def embed_one(self, text: str) -> list[float]:
+        result = await self._post([text])
+        return result[0]
+
+    async def embed_batch(self, texts: list[str]) -> list[list[float]]:
+        if not texts:
+            return []
+        out: list[list[float]] = []
+        for start in range(0, len(texts), self.OPENAI_BATCH_LIMIT):
+            sub = texts[start : start + self.OPENAI_BATCH_LIMIT]
+            out.extend(await self._post(sub))
+        return out
+
+
+@lru_cache(maxsize=1)
+def get_provider() -> EmbeddingProvider:
+    """Return a singleton provider instance based on `settings.embedding_provider`."""
+    if settings.embedding_provider == "openai":
+        return OpenAIProvider()
+    return OllamaProvider()
+
+
+async def get_embedding(text_input: str) -> list[float]:
+    return await get_provider().embed_one(text_input)
+
+
+async def get_embeddings_batch(texts: list[str]) -> list[list[float]]:
+    return await get_provider().embed_batch(texts)
+
+
+async def embed_note(session: AsyncSession, note: NoteMetadata, content: str):
+    """Chunk a note's content, embed, and store in note_embeddings."""
+    chunks = chunk_text(content, chunk_size=settings.chunk_size, overlap=settings.chunk_overlap)
+    if not chunks:
+        return 0
+
+    await session.execute(
+        delete(NoteEmbedding).where(NoteEmbedding.note_id == note.id)
+    )
+
+    try:
+        embeddings = await get_embeddings_batch(chunks)
+    except Exception as e:
+        logger.warning(f"Failed to embed {note.file_path}: {e}")
+        return 0
+
+    for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
+        session.add(NoteEmbedding(
+            note_id=note.id,
+            chunk_index=i,
+            chunk_text=chunk,
+            embedding=embedding,
+        ))
+
+    await session.flush()
+    note.embedded_content_hash = note.content_hash
+    return len(chunks)
+
+
+async def semantic_search(
+    session: AsyncSession,
+    query: str,
+    limit: int = 10,
+    folder: str | None = None,
+    tags: list[str] | None = None,
+    frontmatter: dict | None = None,
+) -> list[dict]:
+    """Embed query and find most similar chunks via cosine distance."""
+    query_embedding = await get_embedding(query)
+
+    stmt = (
+        select(NoteEmbedding, NoteMetadata)
+        .join(NoteMetadata, NoteEmbedding.note_id == NoteMetadata.id)
+    )
+    stmt = apply_note_filters(stmt, folder=folder, tags=tags, frontmatter=frontmatter)
+    stmt = stmt.order_by(
+        NoteEmbedding.embedding.cosine_distance(query_embedding)
+    ).limit(limit)
+
+    result = await session.execute(stmt)
+    rows = result.fetchall()
+    return [
+        {
+            "path": nm.file_path,
+            "title": nm.title,
+            "tags": nm.tags,
+            "chunk": ne.chunk_text[:500],
+            "chunk_index": ne.chunk_index,
+            "similarity": float(np.dot(ne.embedding, query_embedding) / (
+                np.linalg.norm(ne.embedding) * np.linalg.norm(query_embedding)
+            )),
+        }
+        for ne, nm in rows
+    ]

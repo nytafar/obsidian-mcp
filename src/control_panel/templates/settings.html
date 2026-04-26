@@ -1,0 +1,153 @@
+{% extends "base.html" %}
+{% block title %}Settings — Obsidian MCP{% endblock %}
+{% block content %}
+
+<div class="page-top">
+    <h1 class="page-title">Settings</h1>
+</div>
+
+<div class="page-body">
+    <div class="split-2">
+
+        <!-- Indexer -->
+        <div class="card anim-1">
+            <div class="card-header">
+                <span class="card-title">Indexer</span>
+                <div style="display:flex;gap:8px;flex-wrap:wrap;">
+                    <form method="POST" action="/admin/settings/reindex" style="display:inline;">
+                        <button type="submit" class="btn btn-primary" onclick="return confirm('Trigger incremental reindex?')">
+                            <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                                <path d="M13.5 8 A5.5 5.5 0 1 1 11.5 3.8"/>
+                                <polyline points="11.5,1 11.5,4 14.5,4"/>
+                            </svg>
+                            Reindex
+                        </button>
+                    </form>
+                    <a href="/admin/settings/reembed" class="btn btn-danger">
+                        Force Re-embed
+                    </a>
+                </div>
+            </div>
+            <div class="card-body">
+                <div class="kv">
+                    <span class="kv-k">Notes indexed</span>
+                    <span class="kv-v mono">{{ stats.notes_indexed }}</span>
+                </div>
+                <div class="kv">
+                    <span class="kv-k">Embeddings</span>
+                    <span class="kv-v mono">{{ stats.embeddings }}</span>
+                </div>
+                <div class="kv">
+                    <span class="kv-k">Without embeddings</span>
+                    <span class="kv-v mono">{{ stats.notes_indexed - stats.notes_with_embeddings }}</span>
+                </div>
+                <div class="kv">
+                    <span class="kv-k">Index interval</span>
+                    <span class="kv-v mono">{{ index_interval }} s</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- Embedding provider -->
+        <div class="card anim-2">
+            <div class="card-header">
+                <span class="card-title">Embedding provider</span>
+                <span class="badge {% if provider_ok %}badge-green{% else %}badge-red{% endif %}">
+                    {% if provider_ok %}Connected{% else %}Error{% endif %}
+                </span>
+            </div>
+            <div class="card-body">
+                <div class="kv">
+                    <span class="kv-k">Provider</span>
+                    <span class="kv-v mono" style="font-size:12px;">{{ provider.name }}</span>
+                </div>
+                <div class="kv">
+                    <span class="kv-k">Model</span>
+                    <span class="kv-v mono" style="font-size:12px;">{{ provider.model }}</span>
+                </div>
+                <div class="kv">
+                    <span class="kv-k">Dimensions</span>
+                    <span class="kv-v mono">{{ provider.dimensions }}</span>
+                </div>
+                {% if provider.name == "openai" %}
+                <div class="kv">
+                    <span class="kv-k">Base URL</span>
+                    <span class="kv-v mono" style="font-size:11px;color:var(--text-2);">{{ provider.base_url }}</span>
+                </div>
+                <div class="kv">
+                    <span class="kv-k">API key</span>
+                    <span class="kv-v mono" style="font-size:12px;">{{ provider.masked_key }}</span>
+                </div>
+                {% else %}
+                <div class="kv">
+                    <span class="kv-k">Ollama URL</span>
+                    <span class="kv-v mono" style="font-size:11px;color:var(--text-2);">{{ provider.ollama_url }}</span>
+                </div>
+                {% endif %}
+                <div class="kv">
+                    <span class="kv-k">Vault path</span>
+                    <span class="kv-v mono" style="font-size:11px;color:var(--text-2);">{{ vault_path }}</span>
+                </div>
+            </div>
+        </div>
+
+    </div>
+
+    <!-- Danger zone -->
+    <div class="card anim-3" style="margin-top:24px;border-color:rgba(240,110,110,0.25);">
+        <div class="card-header" style="border-bottom-color:rgba(240,110,110,0.2);">
+            <span class="card-title" style="color:var(--error);">Danger zone</span>
+        </div>
+        <div class="card-body">
+            <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:18px;flex-wrap:wrap;">
+                <div style="flex:1;min-width:240px;">
+                    <p style="color:var(--text);font-size:14px;margin:0 0 4px;font-weight:500;">
+                        Reset embeddings
+                    </p>
+                    <p style="color:var(--text-2);font-size:13px;margin:0;line-height:1.55;">
+                        Drops and recreates the embedding column at the
+                        currently configured dimension
+                        ({{ provider.dimensions }}) and clears every note's
+                        embedded hash. The next indexer pass will re-embed
+                        the entire vault. Use this when switching providers
+                        or changing <code>EMBEDDING_DIMENSIONS</code>.
+                    </p>
+                </div>
+                <button type="button"
+                        class="btn btn-danger"
+                        onclick="document.getElementById('reset-modal').style.display='flex';">
+                    Reset embeddings
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Reset confirmation modal -->
+<div id="reset-modal"
+     style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.55);align-items:center;justify-content:center;z-index:50;"
+     onclick="if(event.target===this)this.style.display='none';">
+    <div style="background:var(--bg-2,#1c1c20);border:1px solid var(--border);border-radius:8px;padding:22px 24px;max-width:440px;width:90%;">
+        <h3 style="margin:0 0 8px;font-size:16px;color:var(--error);">Confirm reset</h3>
+        <p style="color:var(--text-2);font-size:13px;line-height:1.55;margin:0 0 18px;">
+            This will delete every embedding row and clear the embedded hash
+            on all notes. The indexer is paused while the reset runs and
+            resumes afterwards. Re-embedding takes time and may incur cost
+            for OpenAI.
+        </p>
+        <div style="display:flex;gap:10px;justify-content:flex-end;">
+            <button type="button"
+                    class="btn btn-ghost"
+                    style="font-size:13px;padding:8px 16px;"
+                    onclick="document.getElementById('reset-modal').style.display='none';">
+                Cancel
+            </button>
+            <form method="POST" action="/admin/settings/reset-embeddings" style="display:inline;">
+                <button type="submit" class="btn btn-danger" style="font-size:13px;padding:8px 16px;">
+                    Yes, reset
+                </button>
+            </form>
+        </div>
+    </div>
+</div>
+{% endblock %}

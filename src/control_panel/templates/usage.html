@@ -1,0 +1,109 @@
+{% extends "base.html" %}
+{% block title %}Usage — Obsidian MCP{% endblock %}
+{% block content %}
+
+<div class="page-top">
+    <h1 class="page-title">Usage</h1>
+</div>
+
+<div class="page-body">
+
+    <!-- Chart -->
+    <div class="card anim-1" style="margin-bottom:20px;">
+        <div class="card-header">
+            <span class="card-title">Requests — Last 14 Days</span>
+        </div>
+        <div class="card-body" style="padding-top:18px;padding-bottom:18px;">
+            <canvas id="usage-chart" height="60"></canvas>
+        </div>
+    </div>
+
+    <!-- Log table -->
+    <div class="card anim-2">
+        <div class="card-header">
+            <span class="card-title">Request Log</span>
+        </div>
+        <div class="table-scroll">
+        <table class="data-table">
+            <thead>
+                <tr>
+                    <th>Time</th>
+                    <th>Key</th>
+                    <th>Tool</th>
+                    <th>Duration</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for log in logs %}
+                <tr>
+                    <td class="mono" style="font-size:11px;color:var(--text-2);">{{ log.created_at }}</td>
+                    <td class="mono" style="font-size:11px;color:var(--text-2);">{{ log.key_prefix or 'unknown' }}</td>
+                    <td style="color:var(--primary-text);font-size:13px;font-weight:500;">{{ log.tool }}</td>
+                    <td class="mono" style="font-size:11px;color:var(--text-2);">
+                        {% if log.duration_ms %}{{ log.duration_ms }} ms{% else %}—{% endif %}
+                    </td>
+                </tr>
+                {% endfor %}
+                {% if not logs %}
+                <tr>
+                    <td colspan="4" style="text-align:center;padding:32px;color:var(--text-3);">No usage data yet.</td>
+                </tr>
+                {% endif %}
+            </tbody>
+        </table>
+        </div>
+    </div>
+
+</div>
+
+<script>
+(function() {
+    const ctx = document.getElementById('usage-chart').getContext('2d');
+    const data = {{ chart_data | tojson }};
+    new Chart(ctx, {
+        type: 'bar',
+        data: {
+            labels: data.labels,
+            datasets: [{
+                label: 'Requests',
+                data: data.values,
+                backgroundColor: 'rgba(139,111,223,0.35)',
+                borderColor: 'rgba(139,111,223,0.8)',
+                borderWidth: 1,
+                borderRadius: 3,
+                borderSkipped: false,
+            }]
+        },
+        options: {
+            responsive: true,
+            plugins: {
+                legend: { display: false },
+                tooltip: {
+                    backgroundColor: '#12192a',
+                    borderColor: '#223050',
+                    borderWidth: 1,
+                    titleColor: '#d8dce8',
+                    bodyColor: '#6e7e9c',
+                    padding: 10,
+                    titleFont: { family: "'DM Sans', sans-serif", size: 12 },
+                    bodyFont:  { family: "'JetBrains Mono', monospace", size: 11 },
+                }
+            },
+            scales: {
+                y: {
+                    beginAtZero: true,
+                    ticks: { color: '#7d8ba6', font: { family: "'JetBrains Mono', monospace", size: 10 } },
+                    grid: { color: '#222c44' },
+                    border: { color: '#222c44' }
+                },
+                x: {
+                    ticks: { color: '#7d8ba6', font: { family: "'JetBrains Mono', monospace", size: 10 } },
+                    grid: { display: false },
+                    border: { color: '#222c44' }
+                }
+            }
+        }
+    });
+})();
+</script>
+{% endblock %}
