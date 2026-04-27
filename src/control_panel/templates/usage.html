@@ -36,7 +36,9 @@
             <tbody>
                 {% for log in logs %}
                 <tr>
-                    <td class="mono" style="font-size:11px;color:var(--text-2);">{{ log.created_at }}</td>
+                    <td class="mono" style="font-size:11px;color:var(--text-2);">
+                        <time datetime="{{ log.created_at }}" data-localize>{{ log.created_at }}</time>
+                    </td>
                     <td class="mono" style="font-size:11px;color:var(--text-2);">{{ log.key_prefix or 'unknown' }}</td>
                     <td style="color:var(--primary-text);font-size:13px;font-weight:500;">{{ log.tool }}</td>
                     <td class="mono" style="font-size:11px;color:var(--text-2);">

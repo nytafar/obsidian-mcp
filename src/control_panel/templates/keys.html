@@ -67,8 +67,12 @@
                         <span class="badge badge-red">Revoked</span>
                         {% endif %}
                     </td>
-                    <td class="mono" style="font-size:11px;color:var(--text-2);">{{ key.last_used_at or '—' }}</td>
-                    <td class="mono" style="font-size:11px;color:var(--text-2);">{{ key.created_at }}</td>
+                    <td class="mono" style="font-size:11px;color:var(--text-2);">
+                        {% if key.last_used_at %}<time datetime="{{ key.last_used_at }}" data-localize>{{ key.last_used_at }}</time>{% else %}—{% endif %}
+                    </td>
+                    <td class="mono" style="font-size:11px;color:var(--text-2);">
+                        <time datetime="{{ key.created_at }}" data-localize="date">{{ key.created_at }}</time>
+                    </td>
                     <td style="white-space:nowrap;">
                         {% if key.is_active %}
                         <form method="POST" action="/admin/keys/{{ key.id }}/revoke" style="display:inline;">

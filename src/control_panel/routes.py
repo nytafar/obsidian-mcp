@@ -135,7 +135,7 @@ async def dashboard(request: Request, session: AsyncSession = Depends(get_sessio
         {
             "tool": l.tool,
             "detail": _usage_detail(l.tool, l.params),
-            "created_at": l.created_at.strftime("%Y-%m-%d %H:%M"),
+            "created_at": l.created_at.isoformat(),
         }
         for l in result.scalars().all()
     ]
@@ -154,7 +154,7 @@ async def dashboard(request: Request, session: AsyncSession = Depends(get_sessio
         },
         "recent_usage": recent_usage,
         "reindexed_24h": reindexed_24h,
-        "last_indexed_at": last_indexed_at,
+        "last_indexed_iso": last_indexed_at.isoformat() if last_indexed_at else None,
         "last_indexed_rel": _humanize_delta(last_indexed_at),
         "index_interval": settings.index_interval_seconds,
         "graph": graph,
@@ -173,8 +173,8 @@ async def keys_page(request: Request, session: AsyncSession = Depends(get_sessio
             "key_prefix": k.key_prefix,
             "permission": k.permission,
             "is_active": k.is_active,
-            "created_at": k.created_at.strftime("%Y-%m-%d"),
-            "last_used_at": k.last_used_at.strftime("%Y-%m-%d %H:%M") if k.last_used_at else None,
+            "created_at": k.created_at.isoformat(),
+            "last_used_at": k.last_used_at.isoformat() if k.last_used_at else None,
         })
     new_key = request.query_params.get("new_key")
     return templates.TemplateResponse(request, "keys.html", {
@@ -265,13 +265,13 @@ async def oauth_page(request: Request, session: AsyncSession = Depends(get_sessi
                 "scope": t.scope,
                 "revoked": t.revoked,
                 "expired": False,
-                "expires_at": t.expires_at.strftime("%Y-%m-%d %H:%M"),
-                "created_at": t.created_at.strftime("%Y-%m-%d %H:%M"),
+                "expires_at": t.expires_at.isoformat(),
+                "created_at": t.created_at.isoformat(),
             })
         clients.append({
             "client_id": c.client_id,
             "client_name": c.client_name,
-            "created_at": c.created_at.strftime("%Y-%m-%d"),
+            "created_at": c.created_at.isoformat(),
             "tokens": tokens,
         })
     return templates.TemplateResponse(request, "oauth.html", {
@@ -331,7 +331,7 @@ async def usage_page(request: Request, session: AsyncSession = Depends(get_sessi
         {
             "tool": r.tool,
             "duration_ms": r.duration_ms,
-            "created_at": r.created_at.strftime("%Y-%m-%d %H:%M"),
+            "created_at": r.created_at.isoformat(),
             "key_prefix": r.key_prefix,
         }
         for r in result.fetchall()

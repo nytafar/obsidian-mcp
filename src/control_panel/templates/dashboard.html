@@ -83,7 +83,9 @@
                             <span style="color:var(--text-2);font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;" title="{{ log.detail }}">{{ log.detail }}</span>
                             {% endif %}
                         </div>
-                        <span class="mono" style="color:var(--text-3);font-size:11px;white-space:nowrap;flex-shrink:0;">{{ log.created_at }}</span>
+                        <span class="mono" style="color:var(--text-3);font-size:11px;white-space:nowrap;flex-shrink:0;">
+                            <time datetime="{{ log.created_at }}" data-localize>{{ log.created_at }}</time>
+                        </span>
                     </div>
                     {% endfor %}
                 </div>
@@ -110,7 +112,7 @@
                 <div class="kv" style="padding:12px 0;border-top:1px solid var(--border);">
                     <span class="kv-k">Last run</span>
                     <span class="kv-v mono" style="font-size:12px;">
-                        {% if last_indexed_at %}{{ last_indexed_at.strftime("%Y-%m-%d %H:%M UTC") }}{% else %}Never{% endif %}
+                        {% if last_indexed_iso %}<time datetime="{{ last_indexed_iso }}" data-localize>{{ last_indexed_iso }}</time>{% else %}Never{% endif %}
                     </span>
                 </div>
                 <div style="margin-top:16px;padding:14px;border-radius:6px;background:rgba(155,130,232,0.05);border:1px solid rgba(155,130,232,0.15);font-size:13px;color:var(--text-2);line-height:1.5;">

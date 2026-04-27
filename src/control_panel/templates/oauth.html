@@ -30,7 +30,7 @@
                     <div class="mono" style="font-size:10px;color:var(--text-3);margin-top:3px;">{{ client.client_id }}</div>
                 </div>
                 <div style="display:flex;align-items:center;gap:14px;">
-                    <span style="font-size:11px;color:var(--text-3);">Registered {{ client.created_at }}</span>
+                    <span style="font-size:11px;color:var(--text-3);">Registered <time datetime="{{ client.created_at }}" data-localize="date">{{ client.created_at }}</time></span>
                     <form method="POST" action="/admin/oauth/{{ client.client_id }}/delete" style="display:inline;">
                         <button type="submit" class="btn btn-danger" style="font-size:11px;padding:4px 12px;" onclick="return confirm('Delete this client and revoke all its tokens?')">Delete</button>
                     </form>
@@ -81,8 +81,12 @@
                             <span class="badge badge-green">Active</span>
                             {% endif %}
                         </td>
-                        <td class="mono" style="font-size:11px;color:var(--text-3);">{{ token.expires_at }}</td>
-                        <td class="mono" style="font-size:11px;color:var(--text-3);">{{ token.created_at }}</td>
+                        <td class="mono" style="font-size:11px;color:var(--text-3);">
+                            <time datetime="{{ token.expires_at }}" data-localize>{{ token.expires_at }}</time>
+                        </td>
+                        <td class="mono" style="font-size:11px;color:var(--text-3);">
+                            <time datetime="{{ token.created_at }}" data-localize>{{ token.created_at }}</time>
+                        </td>
                         <td>
                             {% if not token.revoked and not token.expired %}
                             <form method="POST" action="/admin/oauth/token/{{ token.id }}/revoke" style="display:inline;">

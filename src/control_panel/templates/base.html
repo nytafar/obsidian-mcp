@@ -836,6 +836,24 @@ document.querySelectorAll('.sidebar .nav-item').forEach(function(a) {
         document.querySelector('.sidebar-backdrop').classList.remove('open');
     });
 });
+
+// Localize ISO-8601 UTC timestamps to the viewer's locale.
+(function() {
+    const fmtDateTime = new Intl.DateTimeFormat(undefined, {
+        year: 'numeric', month: '2-digit', day: '2-digit',
+        hour: '2-digit', minute: '2-digit', hour12: false,
+    });
+    const fmtDate = new Intl.DateTimeFormat(undefined, {
+        year: 'numeric', month: '2-digit', day: '2-digit',
+    });
+    document.querySelectorAll('time[data-localize]').forEach(function(el) {
+        const iso = el.getAttribute('datetime');
+        if (!iso) return;
+        const d = new Date(iso);
+        if (isNaN(d)) return;
+        el.textContent = el.dataset.localize === 'date' ? fmtDate.format(d) : fmtDateTime.format(d);
+    });
+})();
 </script>
 
 </body>
