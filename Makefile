@@ -1,12 +1,19 @@
 # Obsidian MCP Server
 # Manages build, deploy, and database operations
 
+# Optional host-specific overrides (gitignored). Set DEPLOY_DIR / DATA_DIR /
+# REGISTRY here to deploy from a directory outside the repo.
+-include Makefile.local
+
 IMAGE_NAME := obsidian-mcp
 IMAGE_TAG := latest
-REGISTRY := localhost:5000
+REGISTRY ?= localhost:5000
 FULL_IMAGE := $(REGISTRY)/$(IMAGE_NAME):$(IMAGE_TAG)
+DEPLOY_DIR ?= .
 DATA_DIR ?= ./data
-COMPOSE_FILE := docker-compose.yml
+COMPOSE_FILE := $(DEPLOY_DIR)/docker-compose.yml
+ENV_FILE := $(DEPLOY_DIR)/.env
+COMPOSE := docker compose --project-directory $(DEPLOY_DIR) -f $(COMPOSE_FILE)
 
 GREEN := \033[0;32m
 YELLOW := \033[0;33m
@@ -52,16 +59,16 @@ init:
 	@sudo mkdir -p $(DATA_DIR)/backups
 	@sudo chown -R $(shell id -u):$(shell id -g) $(DATA_DIR)
 	@sudo chmod -R 775 $(DATA_DIR)
-	@if [ ! -f ".env" ]; then \
-		echo "$(GREEN)Creating .env from template...$(NC)"; \
-		cp .env.example .env; \
+	@if [ ! -f "$(ENV_FILE)" ]; then \
+		echo "$(GREEN)Creating $(ENV_FILE) from template...$(NC)"; \
+		cp .env.example $(ENV_FILE); \
 		DB_PASS=$$(openssl rand -hex 16); \
 		SECRET=$$(openssl rand -hex 32); \
-		sed -i "s/CHANGE_ME/$$DB_PASS/" .env; \
-		sed -i "s/SECRET_KEY=.*/SECRET_KEY=$$SECRET/" .env; \
-		echo "$(GREEN).env created with random secrets$(NC)"; \
+		sed -i "s/CHANGE_ME/$$DB_PASS/" $(ENV_FILE); \
+		sed -i "s/SECRET_KEY=.*/SECRET_KEY=$$SECRET/" $(ENV_FILE); \
+		echo "$(GREEN)$(ENV_FILE) created with random secrets$(NC)"; \
 	else \
-		echo "$(YELLOW).env already exists$(NC)"; \
+		echo "$(YELLOW)$(ENV_FILE) already exists$(NC)"; \
 	fi
 	@echo "$(GREEN)Setup complete. Next: make db-init && make deploy$(NC)"
 
@@ -86,24 +93,24 @@ image: build push
 deploy: image
 	@echo "$(GREEN)Deploying Obsidian MCP...$(NC)"
 	@$(MAKE) db-backup 2>/dev/null || true
-	docker compose -f $(COMPOSE_FILE) up -d --force-recreate
-	@HOST=$$(grep -E '^MCP_HOSTNAME=' .env 2>/dev/null | cut -d= -f2); \
+	$(COMPOSE) up -d --force-recreate
+	@HOST=$$(grep -E '^MCP_HOSTNAME=' $(ENV_FILE) 2>/dev/null | cut -d= -f2); \
 	echo "$(GREEN)Deployed! https://$${HOST:-localhost}$(NC)"
 
 up:
-	docker compose -f $(COMPOSE_FILE) up -d
+	$(COMPOSE) up -d
 
 down:
-	docker compose -f $(COMPOSE_FILE) down
+	$(COMPOSE) down
 
 restart:
-	docker compose -f $(COMPOSE_FILE) restart obsidian-mcp
+	$(COMPOSE) restart obsidian-mcp
 
 logs:
-	docker compose -f $(COMPOSE_FILE) logs -f --tail=100 obsidian-mcp
+	$(COMPOSE) logs -f --tail=100 obsidian-mcp
 
 shell:
-	docker compose -f $(COMPOSE_FILE) exec obsidian-mcp bash
+	$(COMPOSE) exec obsidian-mcp bash
 
 db-init:
 	@echo "$(GREEN)Initializing database...$(NC)"
@@ -112,7 +119,7 @@ db-init:
 
 db-migrate:
 	@echo "$(GREEN)Running migrations...$(NC)"
-	docker compose -f $(COMPOSE_FILE) exec obsidian-mcp alembic upgrade head
+	$(COMPOSE) exec obsidian-mcp alembic upgrade head
 	@echo "$(GREEN)Migrations complete$(NC)"
 
 db-backup:
@@ -143,15 +150,15 @@ reset-embeddings:
 	@echo "$(YELLOW)Resetting embeddings — column will be recreated at EMBEDDING_DIMENSIONS$(NC)"
 	@echo "Press Ctrl+C to cancel, waiting 5s..."
 	@sleep 5
-	docker compose -f $(COMPOSE_FILE) exec obsidian-mcp python -m scripts.reset_embeddings
+	$(COMPOSE) exec obsidian-mcp python -m scripts.reset_embeddings
 	@echo "$(GREEN)Done. The next indexer pass will re-embed all notes.$(NC)"
 
 status:
 	@echo "$(GREEN)Obsidian MCP Status:$(NC)"
-	@docker compose -f $(COMPOSE_FILE) ps
+	@$(COMPOSE) ps
 	@echo ""
 	@echo "$(GREEN)Health:$(NC)"
-	@HOST=$$(grep -E '^MCP_HOSTNAME=' .env 2>/dev/null | cut -d= -f2); \
+	@HOST=$$(grep -E '^MCP_HOSTNAME=' $(ENV_FILE) 2>/dev/null | cut -d= -f2); \
 	URL=$${HOST:+https://$$HOST/health}; \
 	URL=$${URL:-http://localhost:8000/health}; \
 	curl -s $$URL | python3 -m json.tool 2>/dev/null || echo "$(RED)Not responding$(NC)"
