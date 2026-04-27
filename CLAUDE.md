@@ -32,6 +32,19 @@ Self-hosted MCP server exposing an Obsidian vault (~2,577 markdown files) via se
 - Registry: `localhost:5000` (or change in `Makefile`)
 - Deploy: `make deploy` (build → push → backup → recreate)
 
+## Public repo — host paths live outside the tree
+This repo is published on GitHub. Anything host-specific (paths, secrets,
+hostnames) must stay out of tracked files. The mechanism:
+- `Makefile.local` (gitignored) overrides `DEPLOY_DIR` and `DATA_DIR`. On
+  the production host both point at `/storage/docker/data/obsidian-mcp/`,
+  which holds the real `docker-compose.yml`, `.env`, and `backups/`.
+- The compose project that owns the running container is rooted at
+  `$(DEPLOY_DIR)`, not the repo. Always invoke `make` from the repo so
+  `Makefile.local` loads — `cd /storage/docker/data/obsidian-mcp && docker
+  compose ...` works but skips the build/push pipeline.
+- The repo's `docker-compose.yml` and the deploy-dir copy are kept
+  identical; if you change one, copy it over.
+
 ## Commands
 - `make init` — first-time setup
 - `make deploy` — full build and deploy
