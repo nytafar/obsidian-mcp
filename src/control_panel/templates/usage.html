@@ -39,7 +39,16 @@
                     <td class="mono" style="font-size:11px;color:var(--text-2);">
                         <time datetime="{{ log.created_at }}" data-localize>{{ log.created_at }}</time>
                     </td>
-                    <td class="mono" style="font-size:11px;color:var(--text-2);">{{ log.key_prefix or 'unknown' }}</td>
+                    <td style="font-size:12px;line-height:1.3;">
+                        {% if log.actor_name %}
+                            <div style="color:var(--primary-text);">{{ log.actor_name }}</div>
+                            {% if log.actor_detail %}
+                                <div class="mono" style="font-size:10px;color:var(--text-3);">{{ log.actor_detail }}</div>
+                            {% endif %}
+                        {% else %}
+                            <div class="mono" style="font-size:11px;color:var(--text-3);">unknown</div>
+                        {% endif %}
+                    </td>
                     <td style="color:var(--primary-text);font-size:13px;font-weight:500;">{{ log.tool }}</td>
                     <td class="mono" style="font-size:11px;color:var(--text-2);">
                         {% if log.duration_ms %}{{ log.duration_ms }} ms{% else %}—{% endif %}

@@ -8,7 +8,7 @@ from functools import wraps
 from pathlib import Path, PurePosixPath
 
 from src.database import async_session
-from src.mcp_server.auth import current_api_key_id, current_permission
+from src.mcp_server.auth import current_api_key_id, current_oauth_token_id, current_permission
 from src.models.db import UsageLog
 from src.services.embeddings import semantic_search
 from src.services.filters import apply_note_filters
@@ -45,6 +45,7 @@ async def _log_usage(tool: str, params: dict, duration_ms: int, response_size: i
         async with async_session() as session:
             session.add(UsageLog(
                 key_id=current_api_key_id.get(),
+                oauth_token_id=current_oauth_token_id.get(),
                 tool=tool,
                 params=params,
                 duration_ms=duration_ms,

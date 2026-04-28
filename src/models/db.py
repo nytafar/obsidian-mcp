@@ -47,6 +47,9 @@ class UsageLog(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     key_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("api_keys.id"), nullable=True)
+    oauth_token_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("oauth_tokens.id", ondelete="SET NULL"), nullable=True
+    )
     tool: Mapped[str] = mapped_column(String(100), nullable=False)
     params: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -57,7 +60,10 @@ class UsageLog(Base):
 
     api_key: Mapped["APIKey | None"] = relationship(back_populates="usage_logs")
 
-    __table_args__ = (Index("ix_usage_logs_created_at", "created_at"),)
+    __table_args__ = (
+        Index("ix_usage_logs_created_at", "created_at"),
+        Index("ix_usage_logs_oauth_token_id", "oauth_token_id"),
+    )
 
 
 class NoteMetadata(Base):

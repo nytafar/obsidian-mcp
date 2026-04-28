@@ -317,25 +317,43 @@ async def update_oauth_token_scope(
 
 @router.get("/usage", response_class=HTMLResponse)
 async def usage_page(request: Request, session: AsyncSession = Depends(get_session)):
-    # Recent logs with key prefix
+    # Recent logs with attributed actor (API key name+prefix or OAuth client name)
     result = await session.execute(
         text("""
-            SELECT ul.id, ul.tool, ul.duration_ms, ul.created_at, ak.key_prefix
+            SELECT
+                ul.id,
+                ul.tool,
+                ul.duration_ms,
+                ul.created_at,
+                ak.name        AS api_key_name,
+                ak.key_prefix  AS api_key_prefix,
+                oc.client_name AS oauth_client_name
             FROM usage_logs ul
             LEFT JOIN api_keys ak ON ul.key_id = ak.id
+            LEFT JOIN oauth_tokens ot ON ul.oauth_token_id = ot.id
+            LEFT JOIN oauth_clients oc ON ot.client_id = oc.client_id
             ORDER BY ul.created_at DESC
             LIMIT 100
         """)
     )
-    logs = [
-        {
+    logs = []
+    for r in result.fetchall():
+        if r.api_key_name:
+            actor_name = r.api_key_name
+            actor_detail = r.api_key_prefix
+        elif r.oauth_client_name:
+            actor_name = r.oauth_client_name
+            actor_detail = "OAuth"
+        else:
+            actor_name = None
+            actor_detail = None
+        logs.append({
             "tool": r.tool,
             "duration_ms": r.duration_ms,
             "created_at": r.created_at.isoformat(),
-            "key_prefix": r.key_prefix,
-        }
-        for r in result.fetchall()
-    ]
+            "actor_name": actor_name,
+            "actor_detail": actor_detail,
+        })
 
     # Chart data: requests per day for last 7 days
     chart_result = await session.execute(

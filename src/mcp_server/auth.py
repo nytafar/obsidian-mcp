@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 # Context variables for current request's auth state
 current_permission: ContextVar[str] = ContextVar("current_permission", default="read")
 current_api_key_id: ContextVar[int | None] = ContextVar("current_api_key_id", default=None)
+current_oauth_token_id: ContextVar[int | None] = ContextVar("current_oauth_token_id", default=None)
 
 
 def hash_key(key: str) -> str:
@@ -47,6 +48,7 @@ class APIKeyMiddleware:
         # Set default ContextVar values and capture reset tokens for cleanup
         token_perm = current_permission.set("read")
         token_key = current_api_key_id.set(None)
+        token_oauth = current_oauth_token_id.set(None)
 
         try:
             if token.startswith("omcp_"):
@@ -129,8 +131,10 @@ class APIKeyMiddleware:
 
                     current_permission.set(permission)
                     current_api_key_id.set(None)
+                    current_oauth_token_id.set(oauth_token.id)
 
             await self.app(scope, receive, send)
         finally:
             current_permission.reset(token_perm)
             current_api_key_id.reset(token_key)
+            current_oauth_token_id.reset(token_oauth)
