@@ -9,6 +9,8 @@ client can pick up and use correctly on the first call.
 Stack: Python 3.12, FastAPI, PostgreSQL with pgvector. Pluggable
 embeddings (Ollama bge-m3, or OpenAI `text-embedding-3-{small,large}`).
 
+![Dashboard](screenshots/dashboard.png)
+
 ## Why this exists
 
 There are two things going on here, and they're more interesting
@@ -115,6 +117,46 @@ The server exposes 17 MCP tools across five concerns.
 All write tools route through `src/services/vault.py::write_file`,
 which writes to a tmp file in the same directory and `os.replace()`s
 it onto the destination. A crash mid-write cannot truncate a note.
+
+## Control panel
+
+The server ships with a built-in admin UI for the parts of operations
+that are easier to look at than to query: minting keys, watching the
+indexer, eyeballing tool-call traffic, and resetting embeddings when
+you switch providers.
+
+### Usage
+
+Per-tool-call audit log with a 14-day request histogram. Every MCP
+call is recorded with the calling key, tool name, duration, and
+response size — useful for noticing a misbehaving agent burning
+tokens on something it shouldn't.
+
+![Usage](screenshots/usage.png)
+
+### API keys and OAuth clients
+
+Bearer keys with `read` / `readwrite` scopes for API clients, and a
+separate OAuth 2.0 PKCE flow for clients like Claude Desktop and
+claude.ai that expect a proper authorization-code dance.
+
+![API keys](screenshots/api-keys.png)
+![OAuth clients](screenshots/oauth-clients.png)
+
+### Vault browser
+
+A read-only file tree of the mounted vault, mostly for sanity-checking
+that the container sees what you think it sees.
+
+![Vault](screenshots/vault.png)
+
+### Settings
+
+Indexer status, current embedding provider and model, vault path, and
+the danger-zone reset that drops and recreates the embeddings column
+at the configured dimension. Use this when switching providers.
+
+![Settings](screenshots/settings.png)
 
 ## Quick start
 
