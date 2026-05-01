@@ -18,6 +18,9 @@ async def reset() -> None:
     dim = int(settings.embedding_dimensions)
     print(f"Resetting embeddings to vector({dim})...")
     async with async_session() as session:
+        # The app's per-connection 10s statement_timeout is too tight for
+        # the CREATE INDEX step. Lift it for this transaction.
+        await session.execute(text("SET LOCAL statement_timeout = '5min'"))
         # ALTER COLUMN TYPE on a vector column with a dependent HNSW index
         # is unsafe across pgvector versions — drop and recreate explicitly.
         await session.execute(
