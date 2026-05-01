@@ -20,7 +20,7 @@ YELLOW := \033[0;33m
 RED := \033[0;31m
 NC := \033[0m
 
-.PHONY: help init build build-cached push image deploy up down restart logs shell db-init db-migrate db-backup db-restore status clean reindex reset-embeddings audit
+.PHONY: help init build build-cached push image deploy up down restart logs shell db-init db-migrate db-backup db-restore status clean reindex reset-embeddings audit trivy
 
 help:
 	@echo "$(GREEN)Obsidian MCP Server$(NC)"
@@ -53,6 +53,10 @@ help:
 	@echo "  make reset-embeddings - Drop & recreate embedding column at configured dim"
 	@echo "  make status       - Show container and health status"
 	@echo "  make clean        - Remove containers and images"
+	@echo ""
+	@echo "$(YELLOW)Security:$(NC)"
+	@echo "  make audit        - Audit Python deps (pip-audit)"
+	@echo "  make trivy        - Scan local image for HIGH/CRITICAL CVEs"
 
 init:
 	@echo "$(GREEN)Setting up Obsidian MCP...$(NC)"
@@ -88,7 +92,12 @@ push:
 	docker push $(FULL_IMAGE)
 	@echo "$(GREEN)Pushed: $(FULL_IMAGE)$(NC)"
 
-image: build push
+trivy:
+	@echo "$(GREEN)Scanning $(IMAGE_NAME):$(IMAGE_TAG) for HIGH/CRITICAL CVEs...$(NC)"
+	@trivy image --severity HIGH,CRITICAL --exit-code 1 --ignore-unfixed --no-progress --scanners vuln $(IMAGE_NAME):$(IMAGE_TAG)
+	@echo "$(GREEN)No fixable HIGH/CRITICAL CVEs$(NC)"
+
+image: build trivy push
 
 deploy: image
 	@echo "$(GREEN)Deploying Obsidian MCP...$(NC)"
