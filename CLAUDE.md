@@ -59,8 +59,12 @@ hostnames) must stay out of tracked files. The mechanism:
 - Embeddings: pluggable provider, `EmbeddingProvider` Protocol with two
   implementations (Ollama, OpenAI). Single `EMBEDDING_PROVIDER` env var
   picks the backend; `get_provider()` is a cached singleton. Default is
-  Ollama bge-m3 at 1024 dim, ~500 token chunks.
+  Ollama bge-m3 at 1024 dim, 512 token chunks, no overlap.
 - Full-text search via PostgreSQL tsvector
+- Vector search via pgvector HNSW index on `note_embeddings.embedding`
+  (`vector_cosine_ops`, `m=16, ef_construction=64`); `semantic_search`
+  sets `hnsw.ef_search=80` per query and dedupes per note in Python
+  after a 5x overfetch
 - Indexer runs on startup then every 5 minutes, hash-based change detection
 - Wikilink graph extracted from note bodies into `note_links`; resolved at index time with same-folder-first preference
 

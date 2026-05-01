@@ -67,8 +67,8 @@ The server exposes 17 MCP tools across five concerns.
 ### Search and discovery
 - `keyword_search(query, folder?, tags?, frontmatter?, limit=20)`,
   full-text via PostgreSQL `tsvector`
-- `semantic_search(query, folder?, tags?, frontmatter?, limit=10)`,
-  vector similarity via pgvector
+- `semantic_search(query, folder?, tags?, frontmatter?, limit=15)`,
+  vector similarity via pgvector, one preview chunk per note
 - `list_notes(folder?, limit=50)`, sorted by modified time
 - `get_recent(folder?, limit=20)`, recently changed
 - `get_tags(limit=50)`, tag and count
@@ -303,8 +303,8 @@ into the right behavior even without prompting.
 | `OPENAI_API_KEY` | — | Required when provider is OpenAI |
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | Override for Azure or proxies |
 | `OPENAI_EMBEDDING_MODEL` | `text-embedding-3-small` | OpenAI model |
-| `CHUNK_SIZE` | `1500` | Approx chars per embedding chunk |
-| `CHUNK_OVERLAP` | `50` | Char overlap between chunks |
+| `CHUNK_SIZE` | `512` | Approx tokens per chunk (4-char heuristic) |
+| `CHUNK_OVERLAP` | `0` | Token overlap between chunks |
 
 See `.env.example` for the full set with comments.
 

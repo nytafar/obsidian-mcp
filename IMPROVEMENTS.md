@@ -6,6 +6,7 @@ as formal OpenSpec changes:
 - `openspec/changes/note-filters/` — tag and frontmatter filter parameters on the four query/listing tools, plus a shared filter helper. ✅ shipped.
 - `openspec/changes/wikilink-graph-navigation/` — wikilink graph extraction + backlinks/links/neighborhood/find_related/find_orphans tools. ✅ shipped.
 - `openspec/changes/vault-write-completion/` — atomic writes, expanded `edit_note` modes (`dry_run`, `replace_all`, `section`), plus `move_note`, `delete_note`, and `set_frontmatter` tools. ✅ shipped (covers items #5 and #6 below, minus the explicitly skipped sub-items called out inline).
+- HNSW index on `note_embeddings.embedding` (item #8 below, HNSW portion). ✅ shipped (migration 008, `vector_cosine_ops`, `m=16, ef_construction=64`; `semantic_search` sets `hnsw.ef_search=80` per query and dedupes per note). Chunk size dropped 1500 → 512 with overlap 50 → 0 in the same release.
 
 Everything below is the longer tail. Each item includes intent, why it
 matters, and concrete implementation notes so it's straightforward to spec
@@ -232,19 +233,16 @@ Structured tool returns:
 
 ---
 
-## 8. HNSW index on embeddings + standardize ORM-vs-text
+## 8. Standardize ORM-vs-text in search.py
 
-**Intent.** Add the obvious vector index and finish the ORM migration.
+**Intent.** Finish the ORM migration. (HNSW index portion of this item is
+✅ done — see top of file.)
 
-**Why.** At ~13K chunks, brute-force cosine is fine (~10 ms). At 100K+ it
-will degrade. The migration is one line. Same review pass: search.py still
-uses raw `text()` SQL while embeddings.py was already moved to ORM cosine
-distance — standardize to keep filter helpers (item 1) clean.
+**Why.** `src/services/search.py` still uses raw `text()` SQL while
+`embeddings.py` is on ORM cosine distance. Standardize so filter helpers
+(item 1) compose cleanly across both.
 
 **Implementation notes.**
-- Migration adds `CREATE INDEX ix_note_embeddings_hnsw ON note_embeddings
-  USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction
-  = 64);`. Tunable later if recall drops.
 - Convert `src/services/search.py::full_text_search` to a SQLAlchemy
   `select` with `func.ts_rank_cd(...)` so it composes with the filter
   helper from item 1. (Item 1's tasks already cover this — listed here for
