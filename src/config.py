@@ -16,6 +16,10 @@ class Settings(BaseSettings):
     # Overlap disabled: 2025 chunking benchmarks show no measurable retrieval
     # benefit; some research finds zero overlap optimal.
     chunk_overlap: int = 0
+    # Path globs (fnmatch) skipped by the embedder — files remain
+    # keyword-searchable but produce no vectors. Default skips Excalidraw
+    # plugin files which are ~100% serialized JSON.
+    embedding_exclude_patterns: list[str] = ["*.excalidraw.md"]
     # Public hostname Traefik/Caddy routes to. When set, base_url, allowed_origins,
     # and allowed_hosts are auto-derived (https + this host) unless overridden.
     mcp_hostname: str | None = None

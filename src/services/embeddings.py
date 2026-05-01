@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 import time
 from functools import lru_cache
 from typing import Protocol
@@ -14,6 +15,24 @@ from src.models.db import NoteEmbedding, NoteMetadata
 from src.services.filters import apply_note_filters
 
 logger = logging.getLogger(__name__)
+
+# Strip fenced code blocks before embedding so serialized data dumps
+# (Excalidraw JSON, base64 blobs, mermaid graphs) don't dominate vector
+# space. Keyword search is unaffected — tsvector still indexes everything.
+_FENCE_BACKTICK_RE = re.compile(r"^```[^\n]*\n.*?\n```\s*$", re.MULTILINE | re.DOTALL)
+_FENCE_TILDE_RE = re.compile(r"^~~~[^\n]*\n.*?\n~~~\s*$", re.MULTILINE | re.DOTALL)
+
+
+def clean_for_embedding(content: str) -> str:
+    """Strip fenced code blocks (``` and ~~~) from markdown before embedding.
+
+    Inline backtick code is preserved (typically short identifiers, often
+    semantically meaningful). Indented code blocks are not stripped — they're
+    ambiguous with regular indented prose in personal notes.
+    """
+    content = _FENCE_BACKTICK_RE.sub("", content)
+    content = _FENCE_TILDE_RE.sub("", content)
+    return content
 
 
 def chunk_text(content: str, chunk_size: int = 512, overlap: int = 0) -> list[str]:
@@ -163,7 +182,8 @@ async def get_embeddings_batch(texts: list[str]) -> list[list[float]]:
 
 async def embed_note(session: AsyncSession, note: NoteMetadata, content: str):
     """Chunk a note's content, embed, and store in note_embeddings."""
-    chunks = chunk_text(content, chunk_size=settings.chunk_size, overlap=settings.chunk_overlap)
+    cleaned = clean_for_embedding(content)
+    chunks = chunk_text(cleaned, chunk_size=settings.chunk_size, overlap=settings.chunk_overlap)
     if not chunks:
         return 0
 

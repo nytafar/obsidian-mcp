@@ -1,4 +1,5 @@
 import asyncio
+import fnmatch
 import hashlib
 import logging
 import os
@@ -324,9 +325,30 @@ async def embed_vault():
             return
 
         logger.info(f"Embedding {len(unembedded)} notes...")
+        exclude_patterns = settings.embedding_exclude_patterns or []
         total_chunks = 0
+        skipped_excluded = 0
         for i, row in enumerate(unembedded):
             try:
+                # Skip files matching exclude patterns. Drop any pre-existing
+                # embeddings (in case the file was indexed before exclusion was
+                # configured) and stamp embedded_content_hash so the indexer
+                # doesn't keep re-checking it.
+                if any(fnmatch.fnmatch(row.file_path, pat) for pat in exclude_patterns):
+                    await session.execute(
+                        delete(NoteEmbedding).where(NoteEmbedding.note_id == row.id)
+                    )
+                    await session.execute(
+                        text(
+                            "UPDATE notes_metadata SET embedded_content_hash = :h "
+                            "WHERE id = :i"
+                        ),
+                        {"h": row.content_hash, "i": row.id},
+                    )
+                    await session.commit()
+                    skipped_excluded += 1
+                    continue
+
                 full_path = vault / row.file_path
                 try:
                     raw = full_path.read_text(encoding="utf-8", errors="strict")
@@ -351,7 +373,10 @@ async def embed_vault():
                 logger.warning(f"Failed to embed {row.file_path}: {e}")
                 await session.rollback()
 
-        logger.info(f"Embedding complete: {len(unembedded)} notes, {total_chunks} chunks")
+        logger.info(
+            f"Embedding complete: {len(unembedded)} notes, {total_chunks} chunks"
+            + (f", {skipped_excluded} skipped by exclude patterns" if skipped_excluded else "")
+        )
 
 
 async def cleanup_expired_tokens():
