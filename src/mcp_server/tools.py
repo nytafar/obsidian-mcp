@@ -227,7 +227,7 @@ async def get_recent_impl(
 @_tracked("semantic_search", ["query", "limit", "folder", "tags", "frontmatter"])
 async def semantic_search_impl(
     query: str,
-    limit: int = 10,
+    limit: int = 15,
     folder: str | None = None,
     tags: list[str] | None = None,
     frontmatter: dict | None = None,

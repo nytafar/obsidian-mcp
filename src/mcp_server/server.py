@@ -130,7 +130,7 @@ async def get_recent(
 @mcp.tool()
 async def semantic_search(
     query: str,
-    limit: int = 20,
+    limit: int = 15,
     folder: str | None = None,
     tags: list[str] | None = None,
     frontmatter: dict | None = None,
@@ -140,9 +140,12 @@ async def semantic_search(
 
     For exact identifiers, code symbols, proper nouns, or known phrases, use keyword_search instead.
 
+    Each result is one note (deduped) with its best-matching chunk as a ~500-char preview.
+    Call `read_note` on a result's path to get the full note content.
+
     Args:
         query: Natural language description of what you're looking for.
-        limit: Maximum number of results (default 20).
+        limit: Maximum number of distinct notes to return (default 15).
         folder: Optional folder prefix (e.g. "Projects/").
         tags: Optional list of tag names; only notes carrying ALL listed tags match
             (e.g. ["product"]).

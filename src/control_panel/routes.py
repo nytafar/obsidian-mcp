@@ -576,12 +576,24 @@ async def reset_embeddings(
     indexer_paused = True
     try:
         dim = int(settings.embedding_dimensions)
+        # ALTER COLUMN TYPE on a vector column with a dependent HNSW index
+        # is unsafe across pgvector versions — drop and recreate explicitly.
+        await session.execute(
+            text("DROP INDEX IF EXISTS ix_note_embeddings_embedding_hnsw")
+        )
         await session.execute(delete(NoteEmbedding))
         await session.execute(
             text(f"ALTER TABLE note_embeddings ALTER COLUMN embedding TYPE vector({dim})")
         )
         await session.execute(
             text("UPDATE notes_metadata SET embedded_content_hash = NULL")
+        )
+        await session.execute(
+            text(
+                "CREATE INDEX ix_note_embeddings_embedding_hnsw "
+                "ON note_embeddings USING hnsw (embedding vector_cosine_ops) "
+                "WITH (m = 16, ef_construction = 64)"
+            )
         )
         await session.commit()
     finally:

@@ -106,6 +106,13 @@ class NoteEmbedding(Base):
 
     __table_args__ = (
         Index("ix_note_embeddings_note_id", "note_id"),
+        Index(
+            "ix_note_embeddings_embedding_hnsw",
+            "embedding",
+            postgresql_using="hnsw",
+            postgresql_ops={"embedding": "vector_cosine_ops"},
+            postgresql_with={"m": "16", "ef_construction": "64"},
+        ),
     )
 
 

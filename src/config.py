@@ -12,8 +12,10 @@ class Settings(BaseSettings):
     index_interval_seconds: int = 300
     embedding_model: str = "bge-m3"
     embedding_dimensions: int = 1024
-    chunk_size: int = 1500
-    chunk_overlap: int = 50
+    chunk_size: int = 512  # bge-m3 design point
+    # Overlap disabled: 2025 chunking benchmarks show no measurable retrieval
+    # benefit; some research finds zero overlap optimal.
+    chunk_overlap: int = 0
     # Public hostname Traefik/Caddy routes to. When set, base_url, allowed_origins,
     # and allowed_hosts are auto-derived (https + this host) unless overridden.
     mcp_hostname: str | None = None

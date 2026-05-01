@@ -6,7 +6,7 @@ from typing import Protocol
 
 import httpx
 import numpy as np
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config import settings
@@ -16,7 +16,7 @@ from src.services.filters import apply_note_filters
 logger = logging.getLogger(__name__)
 
 
-def chunk_text(content: str, chunk_size: int = 500, overlap: int = 50) -> list[str]:
+def chunk_text(content: str, chunk_size: int = 512, overlap: int = 0) -> list[str]:
     """Split text into chunks of ~chunk_size tokens with overlap.
     Approximation: 1 token ~ 4 chars.
     """
@@ -193,14 +193,27 @@ async def embed_note(session: AsyncSession, note: NoteMetadata, content: str):
 async def semantic_search(
     session: AsyncSession,
     query: str,
-    limit: int = 10,
+    limit: int = 15,
     folder: str | None = None,
     tags: list[str] | None = None,
     frontmatter: dict | None = None,
 ) -> list[dict]:
-    """Embed query and find most similar chunks via cosine distance."""
+    """Embed query and return the best-matching chunk per note (dedup), ordered by cosine distance.
+
+    The HNSW index handles ranking; we over-fetch chunks and dedup per note in Python
+    so a single verbose note can't dominate the result set. Each result is a pointer
+    to a note plus its most-relevant chunk as preview — the caller should `read_note`
+    for full content.
+    """
     query_embedding = await get_embedding(query)
 
+    # ef_search=80 lifts HNSW recall@10 to ~98% at modest latency cost.
+    # SET LOCAL scopes to the session's current transaction.
+    await session.execute(text("SET LOCAL hnsw.ef_search = 80"))
+
+    # Over-fetch by 5x: HNSW is logarithmic so this is essentially free, and it
+    # gives the per-note dedup enough headroom when a note contributes many chunks.
+    overfetch = max(limit * 5, 50)
     stmt = (
         select(NoteEmbedding, NoteMetadata)
         .join(NoteMetadata, NoteEmbedding.note_id == NoteMetadata.id)
@@ -208,10 +221,21 @@ async def semantic_search(
     stmt = apply_note_filters(stmt, folder=folder, tags=tags, frontmatter=frontmatter)
     stmt = stmt.order_by(
         NoteEmbedding.embedding.cosine_distance(query_embedding)
-    ).limit(limit)
+    ).limit(overfetch)
 
     result = await session.execute(stmt)
     rows = result.fetchall()
+
+    seen: set[int] = set()
+    deduped: list[tuple] = []
+    for ne, nm in rows:
+        if ne.note_id in seen:
+            continue
+        seen.add(ne.note_id)
+        deduped.append((ne, nm))
+        if len(deduped) >= limit:
+            break
+
     return [
         {
             "path": nm.file_path,
@@ -223,5 +247,5 @@ async def semantic_search(
                 np.linalg.norm(ne.embedding) * np.linalg.norm(query_embedding)
             )),
         }
-        for ne, nm in rows
+        for ne, nm in deduped
     ]
