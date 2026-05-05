@@ -1,10 +1,10 @@
 # Obsidian MCP Server
 
 A self-hosted [Model Context Protocol](https://modelcontextprotocol.io)
-server that turns an Obsidian vault into shared cognition for you and
-your AI agents. Not just a filesystem they can poke at. An indexed,
-queryable, self-describing knowledge base that any MCP-compatible
-client can pick up and use correctly on the first call.
+server that lets you and your AI agents work over the same Obsidian
+vault. Indexed, searchable, and self-describing, so agents pick up
+your folder layout, frontmatter schema, and tag conventions on the
+first call instead of being briefed from scratch every session.
 
 Stack: Python 3.12, FastAPI, PostgreSQL with pgvector. Pluggable
 embeddings (Ollama bge-m3, or OpenAI `text-embedding-3-{small,large}`).
@@ -310,9 +310,9 @@ See `.env.example` for the full set with comments.
 
 ### Cost expectations (OpenAI)
 
-Rough first-index spend, assuming an average note around 800 tokens
-(three chunks of about 500 tokens). Pricing is OpenAI's published
-rate at time of writing.
+Rough first-index spend, assuming an average note around 1,500 tokens
+(three 512-token chunks). Pricing is OpenAI's published rate at time
+of writing.
 
 | Model | $/1M tokens | 1k notes | 10k notes | 100k notes |
 | --- | --- | --- | --- | --- |
@@ -388,7 +388,7 @@ UPSERT notes_metadata (path, title, tags[], frontmatter JSONB,
 extract wikilinks/embeds/markdown-links → resolve targets →
 note_links (source_id, target_id or NULL for dangling)
     ↓
-chunk content (≈500 tokens, 50 token overlap) → embed via provider →
+chunk content (512 tokens, no overlap) → embed via provider →
 note_embeddings (note_id, chunk_index, chunk_text, embedding[N])
     ↓
 set embedded_content_hash = content_hash
@@ -411,8 +411,9 @@ ignores mtime jitter. Stale embeddings are caught by the
 | `oauth_clients`, `oauth_codes`, `oauth_tokens` | OAuth 2.0 PKCE state |
 
 GIN indexes on `content_tsvector` and `tags[]`. B-tree indexes on the
-hot foreign keys. pgvector exact NN by default, which works fine up to
-~100k chunks. Switch to IVFFlat or HNSW above that.
+hot foreign keys. pgvector HNSW index on the embedding column
+(`vector_cosine_ops`, `m=16, ef_construction=64`); queries set
+`hnsw.ef_search=80` and dedupe per note in Python after a 5x overfetch.
 
 ## Project layout
 
