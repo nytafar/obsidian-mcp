@@ -13,7 +13,7 @@ embeddings (Ollama bge-m3, or OpenAI `text-embedding-3-{small,large}`).
 
 ## Why this exists
 
-There are two things going on here, and they're more interesting
+There are three things going on here, and they're more interesting
 together than apart.
 
 ### 1. A shared memory layer between you and your agents
@@ -36,6 +36,14 @@ write a project note on Sunday, my Monday-morning briefing agent
 already knows about it. When the agent leaves notes from a research
 session, they show up in my normal Obsidian search.
 
+A concrete version of this: I'll spend a session in Claude Code on a
+project, wrap up, push the commits, and then just say "update
+Obsidian." The agent reads the vault guide, figures out where project
+notes live in my structure, picks the right format and frontmatter,
+and leaves a session log I can later roll into a status report. No
+path-passing, no telling it what to write — the conventions are
+already in the vault, and it follows them.
+
 That's the exocortex idea made concrete: one place that holds
 context, and both the human and the agents reading and writing into it
 on the same terms.
@@ -56,9 +64,33 @@ it. You can delete it. You can grep it. The agent's "memory" is a
 human-auditable artifact that sits in the same place as your own
 notes, with the same tools available.
 
+The home lab is the use case that sold me on this. My vault has notes
+on the rack, the network, and every Home Assistant integration. I can
+say "set up a night-light mode in the master bathroom, 1% after 11pm"
+and a sysadmin agent finds the right config, makes the change, and
+updates the doc in the same pass. Six months later when I've
+forgotten how it works, the answer is in the vault, not buried in
+some chat history I can't search.
+
 The semantic search and wikilink graph still work over that material,
 so retrieval is fast and conceptual. But the substrate is files you
 own, not a black box.
+
+### 3. The vault follows you
+
+The thing that still surprises me is that this is internet-facing.
+Same vault, same notes, reachable from anywhere I happen to be
+talking to an agent — Claude in a browser tab, Claude on my phone on
+the train, an n8n workflow firing on a schedule, a Claude Code
+session on whatever laptop is in front of me. All behind OAuth or a
+bearer key, all hitting the same source of truth.
+
+So when I hear an interesting podcast on a commute and want to think
+out loud about it with Claude on my phone, the agent isn't starting
+cold. It can pull up what I've already written on adjacent topics,
+surface a note I half-finished six months ago, and at the end of the
+conversation suggest updates and write them in. The vault doesn't
+have to be near me to be the thing I'm working in.
 
 ## What's in the box
 
