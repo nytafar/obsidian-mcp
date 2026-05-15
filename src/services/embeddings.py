@@ -228,8 +228,12 @@ async def semantic_search(
     query_embedding = await get_embedding(query)
 
     # ef_search=80 lifts HNSW recall@10 to ~98% at modest latency cost.
-    # SET LOCAL scopes to the session's current transaction.
+    # random_page_cost=1.1 reflects SSD storage; the postgres default of 4
+    # makes the planner avoid the HNSW index in favor of a seq+sort, which
+    # is faster on small tables but degrades linearly as the vault grows.
+    # Both SET LOCALs scope to the current transaction.
     await session.execute(text("SET LOCAL hnsw.ef_search = 80"))
+    await session.execute(text("SET LOCAL random_page_cost = 1.1"))
 
     # Over-fetch by 5x: HNSW is logarithmic so this is essentially free, and it
     # gives the per-note dedup enough headroom when a note contributes many chunks.

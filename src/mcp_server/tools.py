@@ -7,6 +7,8 @@ from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path, PurePosixPath
 
+from sqlalchemy import text
+
 from src.database import async_session
 from src.mcp_server.auth import current_api_key_id, current_oauth_token_id, current_permission
 from src.models.db import UsageLog
@@ -504,6 +506,10 @@ async def find_related_impl(path: str, limit: int = 10) -> str:
 
         avg = np.mean([np.asarray(c, dtype=float) for c in chunks], axis=0)
         avg_list = avg.tolist()
+
+        # Same HNSW tuning as semantic_search — see embeddings.py for context.
+        await session.execute(text("SET LOCAL hnsw.ef_search = 80"))
+        await session.execute(text("SET LOCAL random_page_cost = 1.1"))
 
         # Pull more than `limit` so we can dedupe by note.
         stmt = (
