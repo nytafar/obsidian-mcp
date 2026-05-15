@@ -33,6 +33,10 @@ class Settings(BaseSettings):
     openai_base_url: str = "https://api.openai.com/v1"
     openai_embedding_model: str = "text-embedding-3-small"
 
+    multi_user_mode: bool = False
+    session_max_age: int = 60 * 60 * 24 * 7
+    session_cookie_name: str = "omcp_session"
+
     model_config = {"env_file": ".env"}
 
     @model_validator(mode="after")
@@ -59,6 +63,14 @@ class Settings(BaseSettings):
         if self.embedding_provider == "openai" and not (self.openai_api_key or "").strip():
             raise ValueError(
                 "OPENAI_API_KEY is required when EMBEDDING_PROVIDER=openai"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_multi_user_secret(self) -> "Settings":
+        if self.multi_user_mode and self.secret_key == "changeme":
+            raise ValueError(
+                "SECRET_KEY must be set to a strong random value when MULTI_USER_MODE=true"
             )
         return self
 

@@ -12,6 +12,7 @@ async def full_text_search(
     limit: int = 20,
     tags: list[str] | None = None,
     frontmatter: dict | None = None,
+    user_id: int | None = None,
 ) -> list[dict]:
     """Full-text search over notes_metadata using tsvector."""
     tsquery = func.websearch_to_tsquery("english", query)
@@ -21,7 +22,9 @@ async def full_text_search(
         select(NoteMetadata, rank)
         .where(NoteMetadata.content_tsvector.op("@@")(tsquery))
     )
-    stmt = apply_note_filters(stmt, folder=folder, tags=tags, frontmatter=frontmatter)
+    stmt = apply_note_filters(
+        stmt, folder=folder, tags=tags, frontmatter=frontmatter, user_id=user_id
+    )
     stmt = stmt.order_by(rank.desc()).limit(limit)
 
     result = await session.execute(stmt)

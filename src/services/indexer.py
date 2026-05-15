@@ -11,10 +11,15 @@ from sqlalchemy.dialects.postgresql import insert
 
 from src.config import settings
 from src.database import async_session
-from src.models.db import NoteEmbedding, NoteLink, NoteMetadata, OAuthCode, OAuthToken
+from src.models.db import NoteEmbedding, NoteLink, NoteMetadata, OAuthCode, OAuthToken, User
 from src.services.embeddings import embed_note
 from src.services.links import build_vault_index, extract_links, resolve_target
-from src.services.vault import _vault_root, extract_tags, parse_frontmatter
+from src.services.vault import (
+    _vault_root,
+    extract_tags,
+    parse_frontmatter,
+    warm_user_vault_cache,
+)
 
 # Module-level flag the dashboard reads to surface "link extraction in
 # progress" while the one-shot backfill is running.
@@ -42,10 +47,17 @@ def _content_hash(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
-async def index_vault():
-    """Scan vault, upsert notes_metadata with tsvector, remove deleted files."""
-    vault = _vault_root()
-    logger.info("Starting vault index scan...")
+async def index_vault(user_id: int | None = None):
+    """Scan vault, upsert notes_metadata with tsvector, remove deleted files.
+
+    Single-user mode (`user_id is None`) keeps the legacy behavior: queries
+    and inserts do not filter by `user_id` (NULL passes through every guard).
+    Multi-user mode (`user_id` int) scopes existing-row lookups and stamps
+    `user_id` on every upserted row.
+    """
+    vault = _vault_root(user_id)
+    log_suffix = f" (user_id={user_id})" if user_id is not None else ""
+    logger.info(f"Starting vault index scan...{log_suffix}")
 
     # Collect all .md files (skip dot-dirs)
     files: dict[str, Path] = {}
@@ -55,13 +67,14 @@ async def index_vault():
             continue
         files[str(rel)] = p
 
-    logger.info(f"Found {len(files)} markdown files")
+    logger.info(f"Found {len(files)} markdown files{log_suffix}")
 
     async with async_session() as session:
-        # Get existing hashes
-        result = await session.execute(
-            select(NoteMetadata.file_path, NoteMetadata.content_hash)
-        )
+        # Get existing hashes (scoped to this user when set)
+        existing_stmt = select(NoteMetadata.file_path, NoteMetadata.content_hash)
+        if user_id is not None:
+            existing_stmt = existing_stmt.where(NoteMetadata.user_id == user_id)
+        result = await session.execute(existing_stmt)
         existing = {row.file_path: row.content_hash for row in result.fetchall()}
 
         # Determine changes
@@ -86,6 +99,7 @@ async def index_vault():
             stat = full_path.stat()
 
             to_upsert.append({
+                "user_id": user_id,
                 "file_path": rel_path,
                 "title": title,
                 "tags": tags,
@@ -101,7 +115,14 @@ async def index_vault():
                 batch = to_upsert[batch_start:batch_start + 100]
                 stmt = insert(NoteMetadata).values(batch)
                 stmt = stmt.on_conflict_do_update(
-                    index_elements=["file_path"],
+                    # Match the composite UNIQUE(user_id, file_path) on
+                    # notes_metadata (migration 009). The constraint is
+                    # declared NULLS NOT DISTINCT so single-user-mode
+                    # rows (user_id IS NULL) still collide and upsert
+                    # correctly. Without NULLS NOT DISTINCT, PG 15+ would
+                    # treat each NULL user_id as distinct and silently
+                    # duplicate rows on every indexer pass.
+                    index_elements=["user_id", "file_path"],
                     set_={
                         "title": stmt.excluded.title,
                         "tags": stmt.excluded.tags,
@@ -119,6 +140,23 @@ async def index_vault():
         # Update tsvectors for changed notes
         if to_upsert:
             paths = [n["file_path"] for n in to_upsert]
+            # In multi-user mode the same `file_path` can exist for multiple
+            # users; the UPDATE must also scope by `user_id IS NOT DISTINCT
+            # FROM :uid` (NULL-safe equality so single-user rows match).
+            if user_id is None:
+                tsv_sql = """
+                    UPDATE notes_metadata
+                    SET content_tsvector = to_tsvector('english', :content)
+                    WHERE file_path = :path
+                      AND user_id IS NULL
+                """
+            else:
+                tsv_sql = """
+                    UPDATE notes_metadata
+                    SET content_tsvector = to_tsvector('english', :content)
+                    WHERE file_path = :path
+                      AND user_id = :uid
+                """
             for path in paths:
                 full_path = vault / path
                 try:
@@ -128,27 +166,26 @@ async def index_vault():
                         logger.warning(f"Skipping non-UTF8 file: {path}")
                         continue
                     _, content = parse_frontmatter(raw)
-                    await session.execute(
-                        text("""
-                            UPDATE notes_metadata
-                            SET content_tsvector = to_tsvector('english', :content)
-                            WHERE file_path = :path
-                        """),
-                        {"content": content[:100000], "path": path},  # Truncate very large files
-                    )
+                    params: dict = {"content": content[:100000], "path": path}
+                    if user_id is not None:
+                        params["uid"] = user_id
+                    await session.execute(text(tsv_sql), params)
                 except Exception as e:
                     logger.warning(f"Failed to update tsvector for {path}: {e}")
             await session.commit()
-            logger.info(f"Updated tsvectors for {len(paths)} notes")
+            logger.info(f"Updated tsvectors for {len(paths)} notes{log_suffix}")
 
-        # Remove deleted files
+        # Remove deleted files (scoped to this user when set)
         deleted_paths = set(existing.keys()) - set(files.keys())
         if deleted_paths:
-            await session.execute(
-                delete(NoteMetadata).where(NoteMetadata.file_path.in_(deleted_paths))
+            del_stmt = delete(NoteMetadata).where(
+                NoteMetadata.file_path.in_(deleted_paths)
             )
+            if user_id is not None:
+                del_stmt = del_stmt.where(NoteMetadata.user_id == user_id)
+            await session.execute(del_stmt)
             await session.commit()
-            logger.info(f"Removed {len(deleted_paths)} deleted notes")
+            logger.info(f"Removed {len(deleted_paths)} deleted notes{log_suffix}")
 
         # ── Link extraction for changed notes ───────────────────────────
         # We rebuild the vault_index here (post-commit), then for each
@@ -157,24 +194,37 @@ async def index_vault():
         # previously-dangling rows now matching their path.
         if to_upsert or deleted_paths:
             await _update_links_for_changed(
-                session, vault, [n["file_path"] for n in to_upsert]
+                session,
+                vault,
+                [n["file_path"] for n in to_upsert],
+                user_id=user_id,
             )
 
-    logger.info("Vault index scan complete")
+    logger.info(f"Vault index scan complete{log_suffix}")
 
 
-async def _update_links_for_changed(session, vault: Path, changed_paths: list[str]):
+async def _update_links_for_changed(
+    session,
+    vault: Path,
+    changed_paths: list[str],
+    user_id: int | None = None,
+):
     """Re-extract and upsert links for the given changed paths.
 
     Builds a fresh `vault_index` from `notes_metadata`, then for every changed
     note: deletes existing rows, extracts links, resolves targets, inserts.
     Finally, runs a re-resolution pass to attach previously-dangling rows
     whose `target_path` matches any of the changed notes.
+
+    In multi-user mode the vault_index is scoped to `user_id` so a user's
+    wikilinks cannot resolve to another user's note (they share the same
+    `file_path` string but live in distinct `notes_metadata.id`s).
     """
-    # Build vault_index once for the entire pass.
-    rows = (await session.execute(
-        select(NoteMetadata.file_path, NoteMetadata.id)
-    )).all()
+    # Build vault_index once for the entire pass — scoped to this user when set.
+    vi_stmt = select(NoteMetadata.file_path, NoteMetadata.id)
+    if user_id is not None:
+        vi_stmt = vi_stmt.where(NoteMetadata.user_id == user_id)
+    rows = (await session.execute(vi_stmt)).all()
     vault_index = build_vault_index([(r.file_path, r.id) for r in rows])
     paths_to_id: dict[str, int] = vault_index["paths"]
 
@@ -222,33 +272,60 @@ async def _update_links_for_changed(session, vault: Path, changed_paths: list[st
     # Re-resolution pass: any newly-arrived note may resolve previously
     # dangling rows. We patch `target_note_id` for rows whose `target_path`
     # matches one of the changed paths in a few canonical forms.
+    #
+    # In multi-user mode we restrict the UPDATE to rows whose source note
+    # belongs to the same user — otherwise alice's newly-created `foo.md`
+    # would silently get attached as the target of bob's dangling
+    # `[[foo]]` link.
+    if user_id is None:
+        reresolve_sql = """
+            UPDATE note_links
+            SET target_note_id = :nid
+            WHERE target_note_id IS NULL
+              AND target_path IN (:full, :stem, :no_ext)
+        """
+    else:
+        reresolve_sql = """
+            UPDATE note_links
+            SET target_note_id = :nid
+            WHERE target_note_id IS NULL
+              AND target_path IN (:full, :stem, :no_ext)
+              AND source_note_id IN (
+                  SELECT id FROM notes_metadata WHERE user_id = :uid
+              )
+        """
     for path in changed_paths:
         nid = paths_to_id.get(path)
         if nid is None:
             continue
         stem = os.path.splitext(os.path.basename(path))[0]
         path_no_ext = path[:-3] if path.endswith(".md") else path
-        await session.execute(
-            text("""
-                UPDATE note_links
-                SET target_note_id = :nid
-                WHERE target_note_id IS NULL
-                  AND target_path IN (:full, :stem, :no_ext)
-            """),
-            {"nid": nid, "full": path, "stem": stem, "no_ext": path_no_ext},
-        )
+        params: dict = {
+            "nid": nid,
+            "full": path,
+            "stem": stem,
+            "no_ext": path_no_ext,
+        }
+        if user_id is not None:
+            params["uid"] = user_id
+        await session.execute(text(reresolve_sql), params)
     if changed_paths:
         await session.commit()
 
 
-async def link_backfill_pass():
+async def link_backfill_pass(user_id: int | None = None):
     """One-shot backfill that populates `note_links` for every note.
 
     Runs on startup if the table is empty. Iterates all notes, extracts
     links, resolves targets, batches inserts, and logs progress.
+
+    In multi-user mode each user's pass scopes its scan + vault_index to its
+    own `notes_metadata` rows. The "table is empty" guard still checks the
+    global count to preserve the original one-shot semantics across mode
+    flips.
     """
     global link_backfill_in_progress
-    vault = _vault_root()
+    vault = _vault_root(user_id)
     async with async_session() as session:
         existing = (await session.execute(
             select(func.count(NoteLink.id))
@@ -256,14 +333,16 @@ async def link_backfill_pass():
         if existing > 0:
             return
 
-        rows = (await session.execute(
-            select(NoteMetadata.id, NoteMetadata.file_path)
-        )).all()
+        rows_stmt = select(NoteMetadata.id, NoteMetadata.file_path)
+        if user_id is not None:
+            rows_stmt = rows_stmt.where(NoteMetadata.user_id == user_id)
+        rows = (await session.execute(rows_stmt)).all()
         if not rows:
             return
 
         link_backfill_in_progress = True
-        logger.info(f"Starting link backfill across {len(rows)} notes")
+        log_suffix = f" (user_id={user_id})" if user_id is not None else ""
+        logger.info(f"Starting link backfill across {len(rows)} notes{log_suffix}")
 
         vault_index = build_vault_index([(r.file_path, r.id) for r in rows])
 
@@ -302,29 +381,50 @@ async def link_backfill_pass():
             link_backfill_in_progress = False
 
 
-async def embed_vault():
-    """Embed notes that don't have embeddings yet or have changed."""
-    vault = _vault_root()
-    logger.info("Starting embedding pass...")
+async def embed_vault(user_id: int | None = None):
+    """Embed notes that don't have embeddings yet or have changed.
+
+    Multi-user mode: only embeds notes belonging to `user_id`. Each note's
+    embeddings go into `note_embeddings`, which inherits user scope via its
+    `note_id` FK back to `notes_metadata`. No `user_id` column on
+    `note_embeddings` itself.
+    """
+    vault = _vault_root(user_id)
+    log_suffix = f" (user_id={user_id})" if user_id is not None else ""
+    logger.info(f"Starting embedding pass...{log_suffix}")
 
     async with async_session() as session:
-        # Find notes without embeddings or with stale embeddings
-        result = await session.execute(
-            text("""
+        # Find notes without embeddings or with stale embeddings, scoped
+        # to this user when set. We bind the user_id parameter even in
+        # single-user mode and compare with `IS NOT DISTINCT FROM` so the
+        # NULL case still selects all rows without a separate branch.
+        if user_id is None:
+            sql = """
                 SELECT nm.id, nm.file_path, nm.content_hash
                 FROM notes_metadata nm
                 WHERE nm.embedded_content_hash IS NULL
                    OR nm.embedded_content_hash != nm.content_hash
                 ORDER BY nm.modified_at DESC
-            """)
-        )
+            """
+            params: dict = {}
+        else:
+            sql = """
+                SELECT nm.id, nm.file_path, nm.content_hash
+                FROM notes_metadata nm
+                WHERE nm.user_id = :uid
+                  AND (nm.embedded_content_hash IS NULL
+                       OR nm.embedded_content_hash != nm.content_hash)
+                ORDER BY nm.modified_at DESC
+            """
+            params = {"uid": user_id}
+        result = await session.execute(text(sql), params)
         unembedded = result.fetchall()
 
         if not unembedded:
-            logger.info("All notes already embedded")
+            logger.info(f"All notes already embedded{log_suffix}")
             return
 
-        logger.info(f"Embedding {len(unembedded)} notes...")
+        logger.info(f"Embedding {len(unembedded)} notes...{log_suffix}")
         exclude_patterns = settings.embedding_exclude_patterns or []
         total_chunks = 0
         skipped_excluded = 0
@@ -374,7 +474,7 @@ async def embed_vault():
                 await session.rollback()
 
         logger.info(
-            f"Embedding complete: {len(unembedded)} notes, {total_chunks} chunks"
+            f"Embedding complete{log_suffix}: {len(unembedded)} notes, {total_chunks} chunks"
             + (f", {skipped_excluded} skipped by exclude patterns" if skipped_excluded else "")
         )
 
@@ -421,31 +521,99 @@ def _is_paused() -> bool:
         return False
 
 
+async def _active_user_ids() -> list[int]:
+    """Return ids of active users with a non-null `vault_path`. Empty list in
+    single-user mode (the caller already takes the legacy NULL-user path)."""
+    async with async_session() as session:
+        # Warm the in-process vault-path cache for every active user before
+        # the indexer kicks off — saves a per-user lookup later.
+        await warm_user_vault_cache(session)
+        result = await session.execute(
+            select(User.id).where(
+                User.is_active.is_(True),
+                User.vault_path.isnot(None),
+            )
+        )
+        return [row[0] for row in result.all()]
+
+
+async def _index_pass_once(user_id: int | None) -> None:
+    """One full index + embed pass for a single user (or single-user mode)."""
+    try:
+        await index_vault(user_id=user_id)
+    except Exception as e:
+        logger.error(f"Index failed (user_id={user_id}): {e}")
+    try:
+        await embed_vault(user_id=user_id)
+    except Exception as e:
+        logger.error(f"Embedding failed (user_id={user_id}): {e}")
+
+
 async def run_indexer_loop():
-    """Run indexer on startup and then periodically."""
-    try:
-        await index_vault()
-    except Exception as e:
-        logger.error(f"Initial index failed: {e}")
+    """Run indexer on startup and then periodically.
 
-    try:
-        await link_backfill_pass()
-    except Exception as e:
-        logger.error(f"Link backfill failed: {e}")
-
-    try:
-        await embed_vault()
-    except Exception as e:
-        logger.error(f"Initial embedding failed: {e}")
-
-    consecutive_failures = 0
-    while True:
-        await asyncio.sleep(settings.index_interval_seconds)
-        if _is_paused():
-            continue
+    Multi-user mode iterates active users sequentially per pass (v1 simplicity;
+    parallelism can come later). Single-user mode runs one legacy pass with
+    `user_id=None`.
+    """
+    if settings.multi_user_mode:
+        # Initial pass per user.
+        user_ids = await _active_user_ids()
+        for uid in user_ids:
+            try:
+                await index_vault(user_id=uid)
+            except Exception as e:
+                logger.error(f"Initial index failed (user_id={uid}): {e}")
+        try:
+            # Link backfill still uses the global "table empty" guard but
+            # runs the per-user pass when triggered. Iterate every user so
+            # each user's notes get their links resolved against their own
+            # vault_index.
+            for uid in user_ids:
+                await link_backfill_pass(user_id=uid)
+        except Exception as e:
+            logger.error(f"Link backfill failed: {e}")
+        for uid in user_ids:
+            try:
+                await embed_vault(user_id=uid)
+            except Exception as e:
+                logger.error(f"Initial embedding failed (user_id={uid}): {e}")
+    else:
         try:
             await index_vault()
+        except Exception as e:
+            logger.error(f"Initial index failed: {e}")
+
+        try:
+            await link_backfill_pass()
+        except Exception as e:
+            logger.error(f"Link backfill failed: {e}")
+
+        try:
             await embed_vault()
+        except Exception as e:
+            logger.error(f"Initial embedding failed: {e}")
+
+    consecutive_failures = 0
+    logger.info(
+        f"Periodic indexer loop armed (interval={settings.index_interval_seconds}s, "
+        f"multi_user={settings.multi_user_mode})"
+    )
+    while True:
+        await asyncio.sleep(settings.index_interval_seconds)
+        logger.info("Periodic indexer tick")
+        if _is_paused():
+            logger.info("Periodic tick skipped (paused)")
+            continue
+        try:
+            if settings.multi_user_mode:
+                # Re-fetch the user list every cycle so newly-added or
+                # newly-deactivated users are picked up without a restart.
+                for uid in await _active_user_ids():
+                    await _index_pass_once(uid)
+            else:
+                await index_vault()
+                await embed_vault()
             await cleanup_expired_tokens()
             consecutive_failures = 0
         except Exception as e:

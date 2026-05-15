@@ -1,0 +1,169 @@
+{% extends "base.html" %}
+{% block title %}Edit {{ target.username }} — Obsidian MCP{% endblock %}
+{% block content %}
+
+<div class="page-top">
+    <h1 class="page-title">Edit user: <span style="color:var(--primary-text);">{{ target.username }}</span></h1>
+    <div class="page-actions">
+        <a href="/admin/users/" class="btn btn-ghost">← Back to users</a>
+    </div>
+</div>
+
+<div class="page-body">
+
+    {% if flash %}
+    <div class="alert alert-success anim-1">{{ flash }}</div>
+    {% endif %}
+    {% if error %}
+    <div class="alert alert-warning anim-1">{{ error }}</div>
+    {% endif %}
+
+    <div class="split-2">
+
+        <!-- Profile / role / vault -->
+        <div class="card anim-1">
+            <div class="card-header">
+                <span class="card-title">Profile</span>
+            </div>
+            <div class="card-body">
+                <form method="POST" action="/admin/users/{{ target.id }}/edit">
+                    <div class="field">
+                        <label class="field-label">Vault Path</label>
+                        <select name="vault_path" class="field-select" id="vault-select">
+                            <option value="">(unassigned — vault tools error)</option>
+                            {% for v in available_vaults %}
+                            <option value="{{ v }}" {% if v == target.vault_path %}selected{% endif %}>{{ v }}</option>
+                            {% endfor %}
+                            <option value="__custom__" {% if target.vault_path and target.vault_path not in available_vaults %}selected{% endif %}>Custom path…</option>
+                        </select>
+                        <input type="text" name="vault_path_custom" id="vault-custom"
+                               class="field-input"
+                               style="margin-top:8px;display:none;"
+                               placeholder="/vaults/<name>"
+                               value="{{ target.vault_path if target.vault_path and target.vault_path not in available_vaults else '' }}">
+                        <div style="font-size:11px;color:var(--text-3);margin-top:6px;">
+                            Must be a subpath of <code class="mono">/vaults/</code> or the legacy mount.
+                            Directory must exist in the container.
+                        </div>
+                    </div>
+                    <div class="field" style="display:flex;align-items:center;gap:10px;">
+                        <input type="checkbox" name="is_admin" id="is_admin" {% if target.is_admin %}checked{% endif %}
+                               style="width:18px;height:18px;accent-color:var(--primary);">
+                        <label for="is_admin" style="font-size:14px;color:var(--text);cursor:pointer;">
+                            Admin
+                            <span style="color:var(--text-3);font-size:12px;display:block;margin-top:2px;">
+                                Sees all users' control-plane data; can manage users + settings.
+                            </span>
+                        </label>
+                    </div>
+                    <div class="field" style="display:flex;align-items:center;gap:10px;">
+                        <input type="checkbox" name="is_active" id="is_active" {% if target.is_active %}checked{% endif %}
+                               style="width:18px;height:18px;accent-color:var(--primary);">
+                        <label for="is_active" style="font-size:14px;color:var(--text);cursor:pointer;">
+                            Active
+                            <span style="color:var(--text-3);font-size:12px;display:block;margin-top:2px;">
+                                Inactive users cannot log in and are skipped by the indexer.
+                            </span>
+                        </label>
+                    </div>
+                    {% if is_self %}
+                    <div class="alert alert-warning" style="margin-top:8px;font-size:12px;">
+                        This is your own account — you can't remove your own admin role or deactivate yourself here.
+                    </div>
+                    {% endif %}
+                    <div style="display:flex;gap:10px;margin-top:18px;">
+                        <button type="submit" class="btn btn-primary">Save</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+
+        <!-- Reset password -->
+        <div class="card anim-2">
+            <div class="card-header">
+                <span class="card-title">Reset password</span>
+            </div>
+            <div class="card-body">
+                <form method="POST" action="/admin/users/{{ target.id }}/reset-password">
+                    <div class="field">
+                        <label class="field-label">New password</label>
+                        <input type="password" name="new_password" required minlength="8"
+                               class="field-input" placeholder="≥ 8 characters" autocomplete="new-password">
+                        <div style="font-size:11px;color:var(--text-3);margin-top:6px;">
+                            Replaces the user's current password. Communicate the new one
+                            to them out-of-band.
+                        </div>
+                    </div>
+                    <button type="submit" class="btn btn-primary">Reset password</button>
+                </form>
+            </div>
+        </div>
+
+    </div>
+
+    <!-- Danger zone -->
+    <div class="card anim-3" style="margin-top:20px;border-color:rgba(245,136,136,0.25);">
+        <div class="card-header">
+            <span class="card-title" style="color:var(--error);">Danger zone</span>
+        </div>
+        <div class="card-body">
+            <div class="kv">
+                <div>
+                    <div class="kv-k">Deactivate user</div>
+                    <div style="color:var(--text-3);font-size:12px;margin-top:4px;">
+                        Soft-delete: sets <code class="mono">is_active=false</code>. Data preserved;
+                        the user can no longer log in. Reversible by re-saving the form above.
+                    </div>
+                </div>
+                <form method="POST" action="/admin/users/{{ target.id }}/delete">
+                    <button type="submit" class="btn btn-danger"
+                            onclick="return confirm('Deactivate {{ target.username }}? They will no longer be able to log in.')">
+                        Deactivate
+                    </button>
+                </form>
+            </div>
+            <div class="kv">
+                <div>
+                    <div class="kv-k" style="color:var(--error);">Permanent delete</div>
+                    <div style="color:var(--text-3);font-size:12px;margin-top:4px;">
+                        Cascades: removes the user row plus all their api_keys / oauth_clients /
+                        oauth_tokens / notes_metadata via FK. Usage logs persist with
+                        <code class="mono">user_id=NULL</code>. <strong>Irreversible.</strong>
+                    </div>
+                </div>
+                <form method="POST" action="/admin/users/{{ target.id }}/delete?permanent=true">
+                    <button type="submit" class="btn btn-danger"
+                            onclick="return confirm('PERMANENTLY DELETE {{ target.username }} and all their data? This cannot be undone.')">
+                        Permanently delete
+                    </button>
+                </form>
+            </div>
+        </div>
+    </div>
+
+</div>
+
+<script>
+// Toggle custom-path input visibility based on dropdown selection.
+(function() {
+    const sel = document.getElementById('vault-select');
+    const custom = document.getElementById('vault-custom');
+    function update() {
+        if (sel.value === '__custom__') {
+            custom.style.display = 'block';
+            custom.required = true;
+            custom.name = 'vault_path';
+            sel.removeAttribute('name');
+        } else {
+            custom.style.display = 'none';
+            custom.required = false;
+            custom.removeAttribute('name');
+            sel.name = 'vault_path';
+        }
+    }
+    sel.addEventListener('change', update);
+    update();
+})();
+</script>
+
+{% endblock %}

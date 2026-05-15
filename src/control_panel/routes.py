@@ -1,20 +1,35 @@
+import logging
 import os
 import secrets
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 import httpx
-from fastapi import APIRouter, Depends, Form, HTTPException, Request
+from fastapi import APIRouter, Depends, Form, HTTPException, Request, status
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.auth.session import _SingleUserSentinel, get_current_user
 from src.config import settings
 from src.database import get_session
 from src.mcp_server.auth import hash_key
-from src.models.db import APIKey, NoteEmbedding, NoteLink, NoteMetadata, OAuthClient, OAuthToken, UsageLog
+from src.models.db import (
+    APIKey,
+    NoteEmbedding,
+    NoteLink,
+    NoteMetadata,
+    OAuthClient,
+    OAuthToken,
+    User,
+    UsageLog,
+)
+from src.services.vault import warm_user_vault_cache
+
+logger = logging.getLogger(__name__)
 
 
 def _reembed_serializer() -> URLSafeTimedSerializer:
@@ -45,39 +60,186 @@ templates = Jinja2Templates(
 )
 
 
-async def _graph_stats(session: AsyncSession) -> dict:
-    """Return totals + top hub notes for the dashboard's Graph widget."""
-    total_links = (
-        await session.execute(select(func.count(NoteLink.id)))
-    ).scalar() or 0
-    dangling_links = (
-        await session.execute(
-            select(func.count(NoteLink.id)).where(NoteLink.target_note_id.is_(None))
+# --- Auth dependencies ----------------------------------------------------
+#
+# Panel routes need browser-friendly redirects (302 → login) when a session
+# is missing, not the JSON 401 that `require_user` raises. The plain
+# `src.auth.session.require_user` is fine for API contexts; here we wrap it
+# so each handler can pick up a real `User` (or the single-user sentinel) and
+# any unauthenticated request 302s to `/admin/auth/login?next=<original>`.
+
+
+async def require_user_panel(
+    request: Request,
+    user: User | _SingleUserSentinel | None = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    """Return the logged-in user, or raise a 302 redirect to login.
+
+    In single-user mode `get_current_user` returns the sentinel
+    (id=None, is_admin=True, username="admin"), so every handler keeps
+    working with zero per-handler branching. In multi-user mode an absent
+    or inactive user raises a redirect to the login form, preserving
+    `?next=` so the user lands back where they were after signing in.
+
+    Special case: if the users table is empty (fresh multi-user deploy
+    or post-flag-flip pre-bootstrap), redirect to `/admin/register`
+    instead. Without this, users land on a login form they can't pass
+    and have no obvious way to reach the bootstrap form.
+    """
+    if user is None or (isinstance(user, User) and not user.is_active):
+        target = request.url.path
+        if request.url.query:
+            target = f"{target}?{request.url.query}"
+        if settings.multi_user_mode:
+            user_count = (
+                await session.execute(select(func.count(User.id)))
+            ).scalar() or 0
+            if user_count == 0:
+                raise HTTPException(
+                    status_code=status.HTTP_302_FOUND,
+                    headers={"Location": "/admin/register"},
+                )
+        # FastAPI surfaces an HTTPException with a Location header as a 302.
+        raise HTTPException(
+            status_code=status.HTTP_302_FOUND,
+            headers={"Location": f"/admin/auth/login?next={target}"},
         )
-    ).scalar() or 0
+    return user
+
+
+async def require_admin_panel(
+    user: User | _SingleUserSentinel = Depends(require_user_panel),
+):
+    """Gate dangerous handlers (settings, user management) on `is_admin`.
+
+    In single-user mode the sentinel reports `is_admin=True` so these
+    handlers work exactly as today.
+    """
+    if not user.is_admin:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin required")
+    return user
+
+
+# Attach `require_user_panel` to every route in this router. Individual
+# handlers can additionally depend on `require_admin_panel` for the danger
+# zone; FastAPI runs both dependencies but the redirect from the user one
+# fires first if there's no session.
+router.dependencies.append(Depends(require_user_panel))
+
+
+def _panel_context(
+    user: User | _SingleUserSentinel,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Base template context: role/username chrome plus optional extras.
+
+    Every panel handler returning a template merges this in. The single-
+    user sentinel has `username="admin"` and `is_admin=True`, so
+    `base.html`'s `{% if multi_user_mode and username %}` user-badge block
+    stays hidden in single-user mode regardless of how it's rendered.
+    """
+    ctx: dict[str, Any] = {
+        "is_admin": bool(user.is_admin),
+        "username": user.username,
+        "multi_user_mode": bool(settings.multi_user_mode),
+    }
+    if extra:
+        ctx.update(extra)
+    return ctx
+
+
+def _is_admin(user: User | _SingleUserSentinel) -> bool:
+    return bool(user.is_admin)
+
+
+def _scope_user_id(user: User | _SingleUserSentinel) -> int | None:
+    """Return `user.id` for non-admin scoping, or None for "no filter".
+
+    Admins see all rows on the control-plane surfaces (keys/oauth/usage/
+    dashboard); regular users see only their own. Vault contents are a
+    separate concern — even admins only see their own vault since
+    `vault_page` is intentionally per-user (admin can troubleshoot a
+    user's vault by temporarily switching the user record's vault_path,
+    not by browsing another user's files in the UI).
+    """
+    if _is_admin(user):
+        return None
+    return user.id
+
+
+# --- Dashboard ------------------------------------------------------------
+
+
+async def _graph_stats(session: AsyncSession, user_id: int | None) -> dict:
+    """Return totals + top hub notes for the dashboard's Graph widget.
+
+    Admins (user_id=None) see vault-wide stats. Regular users see only
+    their own notes' link graph — links across users can't physically
+    exist because note_links endpoints are always co-user (indexer
+    invariant) but we still filter at read time defensively.
+    """
+    base_links = select(func.count(NoteLink.id))
+    dangling_q = select(func.count(NoteLink.id)).where(NoteLink.target_note_id.is_(None))
+    if user_id is not None:
+        base_links = base_links.join(
+            NoteMetadata, NoteMetadata.id == NoteLink.source_note_id
+        ).where(NoteMetadata.user_id == user_id)
+        dangling_q = dangling_q.join(
+            NoteMetadata, NoteMetadata.id == NoteLink.source_note_id
+        ).where(NoteMetadata.user_id == user_id)
+
+    total_links = (await session.execute(base_links)).scalar() or 0
+    dangling_links = (await session.execute(dangling_q)).scalar() or 0
 
     # Orphans: notes that appear in neither source_note_id nor target_note_id.
-    orphans_stmt = text("""
-        SELECT count(*) FROM notes_metadata nm
-        WHERE nm.id NOT IN (
-            SELECT source_note_id FROM note_links WHERE source_note_id IS NOT NULL
-            UNION
-            SELECT target_note_id FROM note_links WHERE target_note_id IS NOT NULL
-        )
-    """)
-    orphan_count = (await session.execute(orphans_stmt)).scalar() or 0
+    if user_id is None:
+        orphans_stmt = text("""
+            SELECT count(*) FROM notes_metadata nm
+            WHERE nm.id NOT IN (
+                SELECT source_note_id FROM note_links WHERE source_note_id IS NOT NULL
+                UNION
+                SELECT target_note_id FROM note_links WHERE target_note_id IS NOT NULL
+            )
+        """)
+        orphan_params: dict = {}
+    else:
+        orphans_stmt = text("""
+            SELECT count(*) FROM notes_metadata nm
+            WHERE nm.user_id = :uid
+              AND nm.id NOT IN (
+                SELECT source_note_id FROM note_links WHERE source_note_id IS NOT NULL
+                UNION
+                SELECT target_note_id FROM note_links WHERE target_note_id IS NOT NULL
+            )
+        """)
+        orphan_params = {"uid": user_id}
+    orphan_count = (await session.execute(orphans_stmt, orphan_params)).scalar() or 0
 
     # Top 5 hub notes by inbound resolved-link count.
-    hubs_stmt = text("""
-        SELECT nm.file_path, nm.title, count(nl.id) AS hits
-        FROM note_links nl
-        JOIN notes_metadata nm ON nm.id = nl.target_note_id
-        WHERE nl.target_note_id IS NOT NULL
-        GROUP BY nm.id, nm.file_path, nm.title
-        ORDER BY hits DESC
-        LIMIT 5
-    """)
-    hub_rows = (await session.execute(hubs_stmt)).fetchall()
+    if user_id is None:
+        hubs_stmt = text("""
+            SELECT nm.file_path, nm.title, count(nl.id) AS hits
+            FROM note_links nl
+            JOIN notes_metadata nm ON nm.id = nl.target_note_id
+            WHERE nl.target_note_id IS NOT NULL
+            GROUP BY nm.id, nm.file_path, nm.title
+            ORDER BY hits DESC
+            LIMIT 5
+        """)
+        hub_params: dict = {}
+    else:
+        hubs_stmt = text("""
+            SELECT nm.file_path, nm.title, count(nl.id) AS hits
+            FROM note_links nl
+            JOIN notes_metadata nm ON nm.id = nl.target_note_id
+            WHERE nl.target_note_id IS NOT NULL AND nm.user_id = :uid
+            GROUP BY nm.id, nm.file_path, nm.title
+            ORDER BY hits DESC
+            LIMIT 5
+        """)
+        hub_params = {"uid": user_id}
+    hub_rows = (await session.execute(hubs_stmt, hub_params)).fetchall()
     top_hubs = [
         {"path": r.file_path, "title": r.title, "hits": int(r.hits)}
         for r in hub_rows
@@ -92,35 +254,64 @@ async def _graph_stats(session: AsyncSession) -> dict:
 
 
 @router.get("/", response_class=HTMLResponse)
-async def dashboard(request: Request, session: AsyncSession = Depends(get_session)):
-    notes_count = (await session.execute(select(func.count(NoteMetadata.id)))).scalar() or 0
-    notes_with_embeddings = (await session.execute(
-        select(func.count(func.distinct(NoteEmbedding.note_id)))
-    )).scalar() or 0
-    keys_count = (await session.execute(
-        select(func.count(APIKey.id)).where(APIKey.is_active == True)
-    )).scalar() or 0
+async def dashboard(
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+    user=Depends(require_user_panel),
+):
+    uid = _scope_user_id(user)
 
-    requests_today = (await session.execute(
-        text("SELECT count(*) FROM usage_logs WHERE created_at >= date_trunc('day', now())")
-    )).scalar() or 0
+    notes_q = select(func.count(NoteMetadata.id))
+    keys_q = select(func.count(APIKey.id)).where(APIKey.is_active == True)
+    if uid is not None:
+        notes_q = notes_q.where(NoteMetadata.user_id == uid)
+        keys_q = keys_q.where(APIKey.user_id == uid)
 
-    # Embedding coverage
+    notes_count = (await session.execute(notes_q)).scalar() or 0
+
+    # Embeddings count joins through notes_metadata when scoping.
+    if uid is not None:
+        emb_q = (
+            select(func.count(func.distinct(NoteEmbedding.note_id)))
+            .join(NoteMetadata, NoteMetadata.id == NoteEmbedding.note_id)
+            .where(NoteMetadata.user_id == uid)
+        )
+    else:
+        emb_q = select(func.count(func.distinct(NoteEmbedding.note_id)))
+    notes_with_embeddings = (await session.execute(emb_q)).scalar() or 0
+
+    keys_count = (await session.execute(keys_q)).scalar() or 0
+
+    if uid is not None:
+        requests_today = (await session.execute(
+            text(
+                "SELECT count(*) FROM usage_logs "
+                "WHERE created_at >= date_trunc('day', now()) "
+                "AND user_id = :uid"
+            ),
+            {"uid": uid},
+        )).scalar() or 0
+    else:
+        requests_today = (await session.execute(
+            text("SELECT count(*) FROM usage_logs WHERE created_at >= date_trunc('day', now())")
+        )).scalar() or 0
+
     embedding_pct = round(notes_with_embeddings / notes_count * 100) if notes_count else 0
 
-    # Reindex stats (last 24h)
     cutoff_24h = datetime.now(timezone.utc) - timedelta(hours=24)
-    reindexed_24h = (await session.execute(
-        select(func.count(NoteMetadata.id)).where(NoteMetadata.indexed_at >= cutoff_24h)
-    )).scalar() or 0
-    last_indexed_at = (await session.execute(
-        select(func.max(NoteMetadata.indexed_at))
-    )).scalar()
+    reindex_q = select(func.count(NoteMetadata.id)).where(NoteMetadata.indexed_at >= cutoff_24h)
+    last_indexed_q = select(func.max(NoteMetadata.indexed_at))
+    if uid is not None:
+        reindex_q = reindex_q.where(NoteMetadata.user_id == uid)
+        last_indexed_q = last_indexed_q.where(NoteMetadata.user_id == uid)
+    reindexed_24h = (await session.execute(reindex_q)).scalar() or 0
+    last_indexed_at = (await session.execute(last_indexed_q)).scalar()
 
     # Recent usage
-    result = await session.execute(
-        select(UsageLog).order_by(UsageLog.created_at.desc()).limit(10)
-    )
+    usage_q = select(UsageLog).order_by(UsageLog.created_at.desc()).limit(10)
+    if uid is not None:
+        usage_q = usage_q.where(UsageLog.user_id == uid)
+    result = await session.execute(usage_q)
     def _usage_detail(tool: str, params: dict | None) -> str | None:
         if not params:
             return None
@@ -140,10 +331,10 @@ async def dashboard(request: Request, session: AsyncSession = Depends(get_sessio
         for l in result.scalars().all()
     ]
 
-    graph = await _graph_stats(session)
+    graph = await _graph_stats(session, uid)
     from src.services.indexer import link_backfill_in_progress
 
-    return templates.TemplateResponse(request, "dashboard.html", {
+    return templates.TemplateResponse(request, "dashboard.html", _panel_context(user, {
         "active": "dashboard",
         "stats": {
             "notes_indexed": notes_count,
@@ -159,12 +350,23 @@ async def dashboard(request: Request, session: AsyncSession = Depends(get_sessio
         "index_interval": settings.index_interval_seconds,
         "graph": graph,
         "graph_backfill_running": link_backfill_in_progress,
-    })
+    }))
+
+
+# --- API keys -------------------------------------------------------------
 
 
 @router.get("/keys", response_class=HTMLResponse)
-async def keys_page(request: Request, session: AsyncSession = Depends(get_session)):
-    result = await session.execute(select(APIKey).order_by(APIKey.created_at.desc()))
+async def keys_page(
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+    user=Depends(require_user_panel),
+):
+    uid = _scope_user_id(user)
+    q = select(APIKey).order_by(APIKey.created_at.desc())
+    if uid is not None:
+        q = q.where(APIKey.user_id == uid)
+    result = await session.execute(q)
     keys = []
     for k in result.scalars().all():
         keys.append({
@@ -175,11 +377,12 @@ async def keys_page(request: Request, session: AsyncSession = Depends(get_sessio
             "is_active": k.is_active,
             "created_at": k.created_at.isoformat(),
             "last_used_at": k.last_used_at.isoformat() if k.last_used_at else None,
+            "user_id": k.user_id,
         })
     new_key = request.query_params.get("new_key")
-    return templates.TemplateResponse(request, "keys.html", {
+    return templates.TemplateResponse(request, "keys.html", _panel_context(user, {
         "active": "keys", "keys": keys, "new_key": new_key,
-    })
+    }))
 
 
 @router.post("/keys/create")
@@ -187,13 +390,18 @@ async def create_key_form(
     name: str = Form(...),
     permission: str = Form("read"),
     session: AsyncSession = Depends(get_session),
+    user=Depends(require_user_panel),
 ):
     raw_key = f"omcp_{secrets.token_hex(24)}"
+    # Always stamp the creator's user_id (even admins get their own keys
+    # attributed to themselves — admin's omniscient view doesn't extend to
+    # "create keys on behalf of"; that's a separate per-user-edit action).
     api_key = APIKey(
         name=name,
         key_hash=hash_key(raw_key),
         key_prefix=raw_key[:12],
         permission=permission,
+        user_id=user.id,
     )
     session.add(api_key)
     await session.commit()
@@ -201,12 +409,16 @@ async def create_key_form(
 
 
 @router.post("/keys/delete-revoked")
-async def delete_all_revoked(session: AsyncSession = Depends(get_session)):
+async def delete_all_revoked(
+    session: AsyncSession = Depends(get_session),
+    user=Depends(require_user_panel),
+):
     from sqlalchemy import delete as sa_delete, update as sa_update
-    # Null out usage_log references before deleting to satisfy FK constraint
-    revoked_ids = (await session.execute(
-        select(APIKey.id).where(APIKey.is_active == False)
-    )).scalars().all()
+    uid = _scope_user_id(user)
+    revoked_q = select(APIKey.id).where(APIKey.is_active == False)
+    if uid is not None:
+        revoked_q = revoked_q.where(APIKey.user_id == uid)
+    revoked_ids = (await session.execute(revoked_q)).scalars().all()
     if revoked_ids:
         await session.execute(
             sa_update(UsageLog).where(UsageLog.key_id.in_(revoked_ids)).values(key_id=None)
@@ -216,39 +428,71 @@ async def delete_all_revoked(session: AsyncSession = Depends(get_session)):
     return RedirectResponse("/admin/keys", status_code=303)
 
 
+def _assert_key_owner(key: APIKey | None, user: User | _SingleUserSentinel) -> APIKey:
+    if key is None:
+        raise HTTPException(404, "Key not found")
+    # Admin can mutate any key. Regular user can only mutate their own.
+    if not _is_admin(user) and key.user_id != user.id:
+        raise HTTPException(403, "Not your key")
+    return key
+
+
 @router.post("/keys/{key_id}/revoke")
-async def revoke_key_form(key_id: int, session: AsyncSession = Depends(get_session)):
+async def revoke_key_form(
+    key_id: int,
+    session: AsyncSession = Depends(get_session),
+    user=Depends(require_user_panel),
+):
     result = await session.execute(select(APIKey).where(APIKey.id == key_id))
     api_key = result.scalar_one_or_none()
-    if api_key:
-        api_key.is_active = False
-        await session.commit()
+    _assert_key_owner(api_key, user)
+    api_key.is_active = False
+    await session.commit()
     return RedirectResponse("/admin/keys", status_code=303)
 
 
 @router.post("/keys/{key_id}/delete")
-async def delete_key_form(key_id: int, session: AsyncSession = Depends(get_session)):
+async def delete_key_form(
+    key_id: int,
+    session: AsyncSession = Depends(get_session),
+    user=Depends(require_user_panel),
+):
     from sqlalchemy import update as sa_update
-    result = await session.execute(select(APIKey).where(APIKey.id == key_id, APIKey.is_active == False))
+    result = await session.execute(
+        select(APIKey).where(APIKey.id == key_id, APIKey.is_active == False)
+    )
     api_key = result.scalar_one_or_none()
-    if api_key:
-        await session.execute(
-            sa_update(UsageLog).where(UsageLog.key_id == key_id).values(key_id=None)
-        )
-        await session.delete(api_key)
-        await session.commit()
+    _assert_key_owner(api_key, user)
+    await session.execute(
+        sa_update(UsageLog).where(UsageLog.key_id == key_id).values(key_id=None)
+    )
+    await session.delete(api_key)
+    await session.commit()
     return RedirectResponse("/admin/keys", status_code=303)
 
 
+# --- OAuth ----------------------------------------------------------------
+
+
 @router.get("/oauth", response_class=HTMLResponse)
-async def oauth_page(request: Request, session: AsyncSession = Depends(get_session)):
+async def oauth_page(
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+    user=Depends(require_user_panel),
+):
+    uid = _scope_user_id(user)
     now = datetime.now(timezone.utc)
-    result = await session.execute(select(OAuthClient).order_by(OAuthClient.created_at.desc()))
+    q = select(OAuthClient).order_by(OAuthClient.created_at.desc())
+    if uid is not None:
+        q = q.where(OAuthClient.user_id == uid)
+    result = await session.execute(q)
     clients = []
     for c in result.scalars().all():
-        # Only show tokens that are currently usable — expired or revoked ones
-        # are DB-level noise and are cleaned up by the indexer loop.
-        token_result = await session.execute(
+        # Tokens inherit their client's scope, but we also scope tokens by
+        # user_id directly for defense in depth: an unbound/legacy client
+        # could have tokens stamped with a user_id that diverges from the
+        # client's. Filter both ways.
+        token_q = (
             select(OAuthToken)
             .where(
                 OAuthToken.client_id == c.client_id,
@@ -257,6 +501,9 @@ async def oauth_page(request: Request, session: AsyncSession = Depends(get_sessi
             )
             .order_by(OAuthToken.created_at.desc())
         )
+        if uid is not None:
+            token_q = token_q.where(OAuthToken.user_id == uid)
+        token_result = await session.execute(token_q)
         tokens = []
         for t in token_result.scalars().all():
             tokens.append({
@@ -274,28 +521,56 @@ async def oauth_page(request: Request, session: AsyncSession = Depends(get_sessi
             "created_at": c.created_at.isoformat(),
             "tokens": tokens,
         })
-    return templates.TemplateResponse(request, "oauth.html", {
+    return templates.TemplateResponse(request, "oauth.html", _panel_context(user, {
         "active": "oauth", "clients": clients,
-    })
+    }))
+
+
+async def _assert_oauth_client_owner(
+    session: AsyncSession, client_id: str, user: User | _SingleUserSentinel
+) -> OAuthClient:
+    result = await session.execute(select(OAuthClient).where(OAuthClient.client_id == client_id))
+    client = result.scalar_one_or_none()
+    if client is None:
+        raise HTTPException(404, "Client not found")
+    if not _is_admin(user) and client.user_id != user.id:
+        raise HTTPException(403, "Not your client")
+    return client
+
+
+async def _assert_oauth_token_owner(
+    session: AsyncSession, token_id: int, user: User | _SingleUserSentinel
+) -> OAuthToken:
+    result = await session.execute(select(OAuthToken).where(OAuthToken.id == token_id))
+    token = result.scalar_one_or_none()
+    if token is None:
+        raise HTTPException(404, "Token not found")
+    if not _is_admin(user) and token.user_id != user.id:
+        raise HTTPException(403, "Not your token")
+    return token
 
 
 @router.post("/oauth/{client_id}/delete")
-async def delete_oauth_client(client_id: str, session: AsyncSession = Depends(get_session)):
-    result = await session.execute(select(OAuthClient).where(OAuthClient.client_id == client_id))
-    client = result.scalar_one_or_none()
-    if client:
-        await session.delete(client)
-        await session.commit()
+async def delete_oauth_client(
+    client_id: str,
+    session: AsyncSession = Depends(get_session),
+    user=Depends(require_user_panel),
+):
+    client = await _assert_oauth_client_owner(session, client_id, user)
+    await session.delete(client)
+    await session.commit()
     return RedirectResponse("/admin/oauth", status_code=303)
 
 
 @router.post("/oauth/token/{token_id}/revoke")
-async def revoke_oauth_token(token_id: int, session: AsyncSession = Depends(get_session)):
-    result = await session.execute(select(OAuthToken).where(OAuthToken.id == token_id))
-    token = result.scalar_one_or_none()
-    if token:
-        token.revoked = True
-        await session.commit()
+async def revoke_oauth_token(
+    token_id: int,
+    session: AsyncSession = Depends(get_session),
+    user=Depends(require_user_panel),
+):
+    token = await _assert_oauth_token_owner(session, token_id, user)
+    token.revoked = True
+    await session.commit()
     return RedirectResponse("/admin/oauth", status_code=303)
 
 
@@ -304,38 +579,68 @@ async def update_oauth_token_scope(
     token_id: int,
     scope: str = Form(...),
     session: AsyncSession = Depends(get_session),
+    user=Depends(require_user_panel),
 ):
     if scope not in ("read", "readwrite"):
         return RedirectResponse("/admin/oauth", status_code=303)
-    result = await session.execute(select(OAuthToken).where(OAuthToken.id == token_id))
-    token = result.scalar_one_or_none()
-    if token and not token.revoked:
+    token = await _assert_oauth_token_owner(session, token_id, user)
+    if not token.revoked:
         token.scope = scope
         await session.commit()
     return RedirectResponse("/admin/oauth", status_code=303)
 
 
+# --- Usage ----------------------------------------------------------------
+
+
 @router.get("/usage", response_class=HTMLResponse)
-async def usage_page(request: Request, session: AsyncSession = Depends(get_session)):
+async def usage_page(
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+    user=Depends(require_user_panel),
+):
+    uid = _scope_user_id(user)
     # Recent logs with attributed actor (API key name+prefix or OAuth client name)
-    result = await session.execute(
-        text("""
-            SELECT
-                ul.id,
-                ul.tool,
-                ul.duration_ms,
-                ul.created_at,
-                ak.name        AS api_key_name,
-                ak.key_prefix  AS api_key_prefix,
-                oc.client_name AS oauth_client_name
-            FROM usage_logs ul
-            LEFT JOIN api_keys ak ON ul.key_id = ak.id
-            LEFT JOIN oauth_tokens ot ON ul.oauth_token_id = ot.id
-            LEFT JOIN oauth_clients oc ON ot.client_id = oc.client_id
-            ORDER BY ul.created_at DESC
-            LIMIT 100
-        """)
-    )
+    if uid is None:
+        result = await session.execute(
+            text("""
+                SELECT
+                    ul.id,
+                    ul.tool,
+                    ul.duration_ms,
+                    ul.created_at,
+                    ak.name        AS api_key_name,
+                    ak.key_prefix  AS api_key_prefix,
+                    oc.client_name AS oauth_client_name
+                FROM usage_logs ul
+                LEFT JOIN api_keys ak ON ul.key_id = ak.id
+                LEFT JOIN oauth_tokens ot ON ul.oauth_token_id = ot.id
+                LEFT JOIN oauth_clients oc ON ot.client_id = oc.client_id
+                ORDER BY ul.created_at DESC
+                LIMIT 100
+            """)
+        )
+    else:
+        result = await session.execute(
+            text("""
+                SELECT
+                    ul.id,
+                    ul.tool,
+                    ul.duration_ms,
+                    ul.created_at,
+                    ak.name        AS api_key_name,
+                    ak.key_prefix  AS api_key_prefix,
+                    oc.client_name AS oauth_client_name
+                FROM usage_logs ul
+                LEFT JOIN api_keys ak ON ul.key_id = ak.id
+                LEFT JOIN oauth_tokens ot ON ul.oauth_token_id = ot.id
+                LEFT JOIN oauth_clients oc ON ot.client_id = oc.client_id
+                WHERE ul.user_id = :uid
+                ORDER BY ul.created_at DESC
+                LIMIT 100
+            """),
+            {"uid": uid},
+        )
     logs = []
     for r in result.fetchall():
         if r.api_key_name:
@@ -356,31 +661,77 @@ async def usage_page(request: Request, session: AsyncSession = Depends(get_sessi
         })
 
     # Chart data: requests per day for last 7 days
-    chart_result = await session.execute(
-        text("""
-            SELECT date_trunc('day', created_at)::date AS day, count(*) AS cnt
-            FROM usage_logs
-            WHERE created_at >= now() - interval '7 days'
-            GROUP BY day ORDER BY day
-        """)
-    )
+    if uid is None:
+        chart_result = await session.execute(
+            text("""
+                SELECT date_trunc('day', created_at)::date AS day, count(*) AS cnt
+                FROM usage_logs
+                WHERE created_at >= now() - interval '7 days'
+                GROUP BY day ORDER BY day
+            """)
+        )
+    else:
+        chart_result = await session.execute(
+            text("""
+                SELECT date_trunc('day', created_at)::date AS day, count(*) AS cnt
+                FROM usage_logs
+                WHERE created_at >= now() - interval '7 days' AND user_id = :uid
+                GROUP BY day ORDER BY day
+            """),
+            {"uid": uid},
+        )
     chart_rows = chart_result.fetchall()
     chart_data = {
         "labels": [r.day.strftime("%m/%d") for r in chart_rows],
         "values": [r.cnt for r in chart_rows],
     }
 
-    return templates.TemplateResponse(request, "usage.html", {
+    return templates.TemplateResponse(request, "usage.html", _panel_context(user, {
         "active": "usage", "logs": logs, "chart_data": chart_data,
-    })
+    }))
+
+
+# --- Vault browser --------------------------------------------------------
 
 
 @router.get("/vault", response_class=HTMLResponse)
-async def vault_page(request: Request):
+async def vault_page(
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+    user=Depends(require_user_panel),
+):
     folder = request.query_params.get("folder", "")
     selected_note = request.query_params.get("note")
 
-    vault = Path(settings.vault_path)
+    # Resolve the per-user vault root. In single-user mode `user.id` is None
+    # and `_vault_root(None)` returns `settings.vault_path` — the legacy
+    # behavior. In multi-user mode, this requires the cache to be warmed
+    # for the user; login already does that, but we re-warm here so a
+    # session that survived a process restart (no warm yet) still works.
+    if user.id is not None:
+        await warm_user_vault_cache(session, user.id)
+
+    from src.services.vault import _vault_root
+
+    # `_vault_root` raises RuntimeError if the user has no `vault_path`
+    # assigned in multi-user mode. Surface that as a friendly empty state
+    # rather than a 500.
+    try:
+        vault = _vault_root(user.id)
+    except RuntimeError as e:
+        return templates.TemplateResponse(request, "vault.html", _panel_context(user, {
+            "active": "vault",
+            "current_folder": "",
+            "breadcrumbs": [],
+            "folders": [],
+            "notes": [],
+            "selected_note": None,
+            "note_content": None,
+            "note_title": None,
+            "note_tags": [],
+            "vault_error": str(e),
+        }))
+
     base = vault / folder if folder else vault
 
     # Breadcrumbs
@@ -413,14 +764,14 @@ async def vault_page(request: Request):
     if selected_note:
         from src.services.vault import read_file
         try:
-            data = read_file(selected_note)
+            data = read_file(selected_note, user_id=user.id)
             note_content = data["content"]
             note_title = data["title"]
             note_tags = data["tags"]
         except Exception:
             note_content = "Error reading note"
 
-    return templates.TemplateResponse(request, "vault.html", {
+    return templates.TemplateResponse(request, "vault.html", _panel_context(user, {
         "active": "vault",
         "current_folder": folder,
         "breadcrumbs": breadcrumbs,
@@ -430,7 +781,7 @@ async def vault_page(request: Request):
         "note_content": note_content,
         "note_title": note_title,
         "note_tags": note_tags,
-    })
+    }))
 
 
 def _mask_openai_key(key: str | None) -> str:
@@ -447,8 +798,15 @@ def _mask_openai_key(key: str | None) -> str:
     return f"{key[:8]}...{key[-4:]}"
 
 
+# --- Settings (admin only) ------------------------------------------------
+
+
 @router.get("/settings", response_class=HTMLResponse)
-async def settings_page(request: Request, session: AsyncSession = Depends(get_session)):
+async def settings_page(
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+    user=Depends(require_admin_panel),
+):
     notes_count = (await session.execute(select(func.count(NoteMetadata.id)))).scalar() or 0
     embeddings_count = (await session.execute(select(func.count(NoteEmbedding.id)))).scalar() or 0
     notes_with_emb = (await session.execute(
@@ -483,13 +841,11 @@ async def settings_page(request: Request, session: AsyncSession = Depends(get_se
                 r = await client.get(f"{settings.ollama_url}/api/tags")
                 provider_ok = r.status_code == 200
         else:
-            # For OpenAI we don't make a request on every page load — the
-            # presence of a non-empty key is the practical signal here.
             provider_ok = bool((settings.openai_api_key or "").strip())
     except Exception:
         pass
 
-    return templates.TemplateResponse(request, "settings.html", {
+    return templates.TemplateResponse(request, "settings.html", _panel_context(user, {
         "active": "settings",
         "stats": {
             "notes_indexed": notes_count,
@@ -501,7 +857,7 @@ async def settings_page(request: Request, session: AsyncSession = Depends(get_se
         "provider_ok": provider_ok,
         "provider": provider_card,
         "vault_path": settings.vault_path,
-    })
+    }))
 
 
 # Keep strong references to background tasks to prevent GC
@@ -516,29 +872,34 @@ def _spawn(coro):
 
 
 @router.post("/settings/reindex")
-async def trigger_reindex(request: Request):
+async def trigger_reindex(
+    request: Request,
+    user=Depends(require_admin_panel),
+):
     _spawn(_reindex_background())
-    # Dashboard's inline button POSTs with Accept: application/json for no-reload feedback.
-    # Settings page uses a plain form, which expects a redirect.
     if "application/json" in request.headers.get("accept", ""):
         return JSONResponse({"status": "started"})
     return RedirectResponse("/admin/settings", status_code=303)
 
 
 @router.get("/settings/reembed", response_class=HTMLResponse)
-async def reembed_confirm_page(request: Request):
+async def reembed_confirm_page(
+    request: Request,
+    user=Depends(require_admin_panel),
+):
     """Generate a one-time signed token and render a confirmation page."""
     token = _reembed_serializer().dumps(secrets.token_hex(16))
-    return templates.TemplateResponse(request, "reembed_confirm.html", {
+    return templates.TemplateResponse(request, "reembed_confirm.html", _panel_context(user, {
         "active": "settings",
         "token": token,
-    })
+    }))
 
 
 @router.post("/settings/reembed")
 async def trigger_reembed(
     token: str = Form(...),
     session: AsyncSession = Depends(get_session),
+    user=Depends(require_admin_panel),
 ):
     """Clear all embeddings and re-embed from scratch. Requires a valid signed token."""
     try:
@@ -562,6 +923,7 @@ indexer_paused: bool = False
 async def reset_embeddings(
     request: Request,
     session: AsyncSession = Depends(get_session),
+    user=Depends(require_admin_panel),
 ):
     """Recreate `note_embeddings.embedding` at the configured dim and null
     every `embedded_content_hash` so the indexer re-embeds the vault on
@@ -576,11 +938,7 @@ async def reset_embeddings(
     indexer_paused = True
     try:
         dim = int(settings.embedding_dimensions)
-        # The app's per-connection 10s statement_timeout is too tight for
-        # the CREATE INDEX step. Lift it for this transaction.
         await session.execute(text("SET LOCAL statement_timeout = '5min'"))
-        # ALTER COLUMN TYPE on a vector column with a dependent HNSW index
-        # is unsafe across pgvector versions — drop and recreate explicitly.
         await session.execute(
             text("DROP INDEX IF EXISTS ix_note_embeddings_embedding_hnsw")
         )
@@ -602,8 +960,6 @@ async def reset_embeddings(
     finally:
         indexer_paused = False
 
-    # Kick off an immediate reindex pass; the periodic loop will continue
-    # afterwards.
     _spawn(_reindex_background())
 
     if "application/json" in request.headers.get("accept", ""):
@@ -612,7 +968,10 @@ async def reset_embeddings(
 
 
 @router.get("/settings/reset-embeddings/progress")
-async def reset_progress(session: AsyncSession = Depends(get_session)):
+async def reset_progress(
+    session: AsyncSession = Depends(get_session),
+    user=Depends(require_admin_panel),
+):
     """Return re-embedding progress (notes still pending) for dashboard polling."""
     total = (await session.execute(select(func.count(NoteMetadata.id)))).scalar() or 0
     embedded = (await session.execute(
@@ -632,6 +991,20 @@ async def reset_progress(session: AsyncSession = Depends(get_session)):
 
 
 async def _reindex_background():
-    from src.services.indexer import index_vault, embed_vault
-    await index_vault()
-    await embed_vault()
+    # Panel-triggered on-demand reindex. Mirrors `run_indexer_loop` so the
+    # multi-user-mode case fans out to every active user; in single-user
+    # mode it stays a single legacy pass with user_id=None.
+    from src.services.indexer import index_vault, embed_vault, _active_user_ids
+    if settings.multi_user_mode:
+        for uid in await _active_user_ids():
+            try:
+                await index_vault(user_id=uid)
+            except Exception as e:
+                logger.error(f"On-demand index failed (user_id={uid}): {e}")
+            try:
+                await embed_vault(user_id=uid)
+            except Exception as e:
+                logger.error(f"On-demand embedding failed (user_id={uid}): {e}")
+    else:
+        await index_vault()
+        await embed_vault()

@@ -1,0 +1,115 @@
+{% extends "base.html" %}
+{% block title %}Users — Obsidian MCP{% endblock %}
+{% block content %}
+
+<div class="page-top">
+    <h1 class="page-title">Users</h1>
+    <div class="page-actions">
+        <button onclick="document.getElementById('create-modal').classList.add('open')" class="btn btn-primary">
+            <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+                <line x1="6" y1="1" x2="6" y2="11"/><line x1="1" y1="6" x2="11" y2="6"/>
+            </svg>
+            New User
+        </button>
+    </div>
+</div>
+
+<div class="page-body">
+
+    {% if flash %}
+    <div class="alert alert-success anim-1">{{ flash }}</div>
+    {% endif %}
+    {% if error %}
+    <div class="alert alert-warning anim-1">{{ error }}</div>
+    {% endif %}
+
+    <div class="card anim-1">
+        <div class="table-scroll">
+        <table class="data-table">
+            <thead>
+                <tr>
+                    <th>Username</th>
+                    <th>Role</th>
+                    <th>Status</th>
+                    <th>Vault Path</th>
+                    <th>API Keys</th>
+                    <th>Notes</th>
+                    <th>Last Login</th>
+                    <th>Created</th>
+                    <th></th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for u in users %}
+                <tr>
+                    <td style="color:var(--text);font-weight:500;">{{ u.username }}</td>
+                    <td>
+                        {% if u.is_admin %}
+                        <span class="badge badge-purple">Admin</span>
+                        {% else %}
+                        <span class="badge badge-gray">User</span>
+                        {% endif %}
+                    </td>
+                    <td>
+                        {% if u.is_active %}
+                        <span class="badge badge-green">Active</span>
+                        {% else %}
+                        <span class="badge badge-red">Inactive</span>
+                        {% endif %}
+                    </td>
+                    <td class="mono" style="font-size:11px;color:var(--text-2);max-width:280px;overflow:hidden;text-overflow:ellipsis;">
+                        {% if u.vault_path %}{{ u.vault_path }}{% else %}<span style="color:var(--warning);">(unassigned)</span>{% endif %}
+                    </td>
+                    <td class="mono" style="font-size:11px;color:var(--text-2);">{{ u.api_keys }}</td>
+                    <td class="mono" style="font-size:11px;color:var(--text-2);">{{ u.notes }}</td>
+                    <td class="mono" style="font-size:11px;color:var(--text-2);">
+                        {% if u.last_login_at %}<time datetime="{{ u.last_login_at }}" data-localize>{{ u.last_login_at }}</time>{% else %}—{% endif %}
+                    </td>
+                    <td class="mono" style="font-size:11px;color:var(--text-2);">
+                        <time datetime="{{ u.created_at }}" data-localize="date">{{ u.created_at }}</time>
+                    </td>
+                    <td style="white-space:nowrap;">
+                        <a href="/admin/users/{{ u.id }}/edit" class="btn btn-ghost" style="padding:6px 12px;font-size:12px;min-height:0;">Edit</a>
+                    </td>
+                </tr>
+                {% endfor %}
+                {% if not users %}
+                <tr>
+                    <td colspan="9" style="text-align:center;padding:32px;color:var(--text-3);">No users yet.</td>
+                </tr>
+                {% endif %}
+            </tbody>
+        </table>
+        </div>
+    </div>
+
+</div>
+
+<!-- Create modal -->
+<div id="create-modal" class="modal">
+    <div class="modal-panel">
+        <div class="modal-title">Create User</div>
+        <form method="POST" action="/admin/users/create">
+            <div class="field">
+                <label class="field-label">Username</label>
+                <input type="text" name="username" required class="field-input"
+                       placeholder="lowercase letters, digits, underscores"
+                       pattern="[a-z0-9_]{1,64}" autocomplete="off">
+            </div>
+            <div class="field">
+                <label class="field-label">Initial Password</label>
+                <input type="password" name="initial_password" required minlength="8"
+                       class="field-input" placeholder="≥ 8 characters" autocomplete="new-password">
+                <div style="font-size:11px;color:var(--text-3);margin-top:6px;">
+                    Share with the user out-of-band. They can change it after first login.
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" onclick="document.getElementById('create-modal').classList.remove('open')" class="btn btn-ghost">Cancel</button>
+                <button type="submit" class="btn btn-primary">Create</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+{% endblock %}

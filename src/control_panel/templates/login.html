@@ -1,0 +1,45 @@
+{% extends "auth_base.html" %}
+
+{% block title %}Sign in — Obsidian MCP{% endblock %}
+{% block tagline %}Sign in{% endblock %}
+
+{% block content %}
+    <div class="auth-heading">Welcome back</div>
+    <div class="auth-sub">Sign in to manage your Obsidian vault.</div>
+
+    {% if error %}
+        <div class="alert">{{ error }}</div>
+    {% endif %}
+
+    <form method="post" action="/admin/auth/login">
+        <input type="hidden" name="next" value="{{ next or '/admin/' }}">
+
+        <div class="field">
+            <label class="field-label" for="username">Username</label>
+            <input
+                class="field-input"
+                type="text"
+                id="username"
+                name="username"
+                value="{{ username or '' }}"
+                autocomplete="username"
+                autocapitalize="none"
+                spellcheck="false"
+                required
+                autofocus>
+        </div>
+
+        <div class="field">
+            <label class="field-label" for="password">Password</label>
+            <input
+                class="field-input"
+                type="password"
+                id="password"
+                name="password"
+                autocomplete="current-password"
+                required>
+        </div>
+
+        <button class="btn-submit" type="submit">Sign in</button>
+    </form>
+{% endblock %}

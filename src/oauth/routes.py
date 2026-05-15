@@ -2,7 +2,7 @@ import hashlib
 import os
 import secrets
 from datetime import datetime, timedelta, timezone
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 from fastapi import APIRouter, Form, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
@@ -162,6 +162,27 @@ async def authorize_get(
     scope: str = Query("read"),
     state: str = Query(""),
 ):
+    # Multi-user mode: an end-user identity must exist on the request
+    # session before we can stamp it onto the issued code/token. If there's
+    # no session, bounce through login first and come back here. Single-
+    # user mode is unchanged — the consent screen renders without any
+    # session requirement.
+    if settings.multi_user_mode:
+        try:
+            current_uid = request.session.get("user_id")
+        except (AssertionError, AttributeError):
+            current_uid = None
+        if current_uid is None:
+            # Preserve the entire /authorize URL (path + query) so the
+            # client doesn't have to re-issue the request after login.
+            target = request.url.path
+            if request.url.query:
+                target = f"{target}?{request.url.query}"
+            return RedirectResponse(
+                f"/admin/auth/login?next={quote(target, safe='')}",
+                status_code=302,
+            )
+
     if response_type != "code":
         return JSONResponse({"error": "unsupported_response_type"}, status_code=400)
 
@@ -251,9 +272,36 @@ async def authorize_post(
             url += f"&state={client_state}"
         return RedirectResponse(url, status_code=302)
 
+    # Multi-user mode: refuse to mint a code without a session. The GET
+    # handler already redirects to login, but defend against a stale POST
+    # arriving after the session expired.
+    session_user_id: int | None = None
+    if settings.multi_user_mode:
+        try:
+            session_user_id = request.session.get("user_id")
+        except (AssertionError, AttributeError):
+            session_user_id = None
+        if session_user_id is None:
+            return JSONResponse(
+                {"error": "login_required", "error_description": "Session required"},
+                status_code=401,
+            )
+
     code = secrets.token_hex(32)
 
     async with async_session() as session:
+        # Bind the OAuth client to its first-authorizing user. RFC 7591
+        # dynamic registration is unauthenticated, so we can't bind at
+        # registration time — first /authorize wins. Subsequent authorizes
+        # for the same client leave `user_id` alone.
+        if session_user_id is not None:
+            result = await session.execute(
+                select(OAuthClient).where(OAuthClient.client_id == client_id)
+            )
+            client_row = result.scalar_one_or_none()
+            if client_row is not None and client_row.user_id is None:
+                client_row.user_id = session_user_id
+
         oauth_code = OAuthCode(
             code_hash=_hash(code),
             client_id=client_id,
@@ -262,6 +310,7 @@ async def authorize_post(
             code_challenge=code_challenge,
             code_challenge_method=code_challenge_method,
             expires_at=datetime.now(timezone.utc) + timedelta(minutes=10),
+            user_id=session_user_id,
         )
         session.add(oauth_code)
         await session.commit()
@@ -337,7 +386,9 @@ async def _handle_auth_code(form):
         # Mark code as used
         oauth_code.used = True
 
-        # Mint tokens
+        # Mint tokens. In multi-user mode the issued tokens inherit the
+        # `user_id` stamped on the auth code at /authorize time; in single-
+        # user mode that value is NULL and tokens stay NULL too.
         access_token = secrets.token_hex(32)
         refresh_token = secrets.token_hex(32)
 
@@ -347,6 +398,7 @@ async def _handle_auth_code(form):
             client_id=client_id,
             scope=oauth_code.scope,
             expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+            user_id=oauth_code.user_id,
         ))
         session.add(OAuthToken(
             token_hash=_hash(refresh_token),
@@ -354,6 +406,7 @@ async def _handle_auth_code(form):
             client_id=client_id,
             scope=oauth_code.scope,
             expires_at=datetime.now(timezone.utc) + timedelta(days=30),
+            user_id=oauth_code.user_id,
         ))
         await session.commit()
 
@@ -412,6 +465,7 @@ async def _handle_refresh(form):
                 client_id=client_id,
                 scope=old_token.scope,
                 expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+                user_id=old_token.user_id,
             ))
             session.add(OAuthToken(
                 token_hash=_hash(new_refresh),
@@ -419,6 +473,7 @@ async def _handle_refresh(form):
                 client_id=client_id,
                 scope=old_token.scope,
                 expires_at=datetime.now(timezone.utc) + timedelta(days=30),
+                user_id=old_token.user_id,
             ))
 
             # Revoke old refresh token in the same commit

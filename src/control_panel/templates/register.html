@@ -1,0 +1,76 @@
+{% extends "auth_base.html" %}
+
+{% block title %}First-time setup — Obsidian MCP{% endblock %}
+{% block tagline %}First-time setup{% endblock %}
+
+{% block content %}
+    <div class="auth-heading">Bootstrap admin</div>
+    <div class="auth-sub">
+        This is the one-time admin bootstrap. After this, only the admin can
+        create new accounts.
+    </div>
+
+    {% if error %}
+        <div class="alert">{{ error }}</div>
+    {% endif %}
+
+    <form method="post" action="/admin/register">
+        <div class="field">
+            <label class="field-label" for="username">Username</label>
+            <input
+                class="field-input"
+                type="text"
+                id="username"
+                name="username"
+                value="{{ username }}"
+                autocomplete="username"
+                autocapitalize="none"
+                spellcheck="false"
+                pattern="[a-z0-9_]{1,64}"
+                title="lowercase letters, digits, underscores; max 64 chars"
+                required
+                autofocus>
+            <div class="field-hint">Lowercase letters, digits, underscores only.</div>
+        </div>
+
+        <div class="field">
+            <label class="field-label" for="password">Password</label>
+            <input
+                class="field-input"
+                type="password"
+                id="password"
+                name="password"
+                autocomplete="new-password"
+                minlength="8"
+                required>
+            <div class="field-hint">Minimum 8 characters.</div>
+        </div>
+
+        <div class="field">
+            <label class="field-label" for="password_confirm">Confirm password</label>
+            <input
+                class="field-input"
+                type="password"
+                id="password_confirm"
+                name="password_confirm"
+                autocomplete="new-password"
+                minlength="8"
+                required>
+        </div>
+
+        <div class="field">
+            <label class="field-label" for="vault_path">Vault path</label>
+            <input
+                class="field-input"
+                type="text"
+                id="vault_path"
+                name="vault_path"
+                value="{{ vault_path }}"
+                spellcheck="false"
+                required>
+            <div class="field-hint">Path to your vault inside the container (e.g. <code>/obsidian</code>).</div>
+        </div>
+
+        <button class="btn-submit" type="submit">Create admin account</button>
+    </form>
+{% endblock %}

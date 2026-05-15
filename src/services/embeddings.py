@@ -217,6 +217,7 @@ async def semantic_search(
     folder: str | None = None,
     tags: list[str] | None = None,
     frontmatter: dict | None = None,
+    user_id: int | None = None,
 ) -> list[dict]:
     """Embed query and return the best-matching chunk per note (dedup), ordered by cosine distance.
 
@@ -242,7 +243,9 @@ async def semantic_search(
         select(NoteEmbedding, NoteMetadata)
         .join(NoteMetadata, NoteEmbedding.note_id == NoteMetadata.id)
     )
-    stmt = apply_note_filters(stmt, folder=folder, tags=tags, frontmatter=frontmatter)
+    stmt = apply_note_filters(
+        stmt, folder=folder, tags=tags, frontmatter=frontmatter, user_id=user_id
+    )
     stmt = stmt.order_by(
         NoteEmbedding.embedding.cosine_distance(query_embedding)
     ).limit(overfetch)

@@ -9,7 +9,11 @@ engine = create_async_engine(
     max_overflow=10,
     pool_pre_ping=True,
     connect_args={
-        "server_settings": {"statement_timeout": "10000"}  # 10s in ms
+        # 60s — embedding INSERTs into a vector(1024) column with an HNSW
+        # index can take a few seconds each on a large vault. 10s (the old
+        # value) caused QueryCanceledError on occasional notes and may have
+        # left the indexer's session in a stuck state.
+        "server_settings": {"statement_timeout": "60000"}
     },
 )
 

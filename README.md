@@ -320,6 +320,91 @@ literals) plus the vault's `CLAUDE.md` live. The hint to call it first
 is baked into the write-tool descriptions so the agent gets pulled
 into the right behavior even without prompting.
 
+## Multi-user mode
+
+Single-user mode is the default and works exactly as described above —
+one vault, one set of API keys, no in-app user concept. Multi-user mode
+is an opt-in flag that turns the same container into a small
+multi-tenant deployment: in-app username/password login, per-user vault
+scoping, an admin role for troubleshooting, and a regular-user role
+that sees only its own keys/OAuth clients/usage. One container, one
+Postgres, strict isolation between users.
+
+Enable it on an existing deployment with no data loss — your current
+vault and keys carry over to the bootstrap admin.
+
+### Enabling
+
+1. Set `MULTI_USER_MODE=true` and a strong `SECRET_KEY` in `.env`
+   (`openssl rand -hex 32` is fine). The app refuses to start with the
+   placeholder value when the flag is on.
+2. `make deploy` (or `docker compose up -d --force-recreate`).
+3. Visit the panel. Because the `users` table is empty, you're routed
+   to `/admin/register` — the one-time bootstrap form. It's still
+   behind Traefik's `chain-oauth@file` middleware, so only people
+   Traefik already trusts can claim admin.
+4. Register with a chosen username and password. The bootstrap form
+   pre-fills `vault_path` with whatever `VAULT_PATH` was set to, so
+   your existing notes immediately belong to this new admin. No
+   re-index, no re-embed, no data loss — every previously indexed
+   note, API key, OAuth client, and usage log row gets backfilled
+   to the bootstrap user in a single transaction.
+
+### Inviting users
+
+1. Edit `docker-compose.yml` to add a volume mount for the new user's
+   vault under `/vaults/<username>`. Host paths with spaces must be
+   quoted as a single YAML string:
+
+   ```yaml
+   volumes:
+     - "/storage/vaults/alice:/vaults/alice"
+     - "/storage/shared/Oksana Documents/Obsidian:/vaults/oksana"
+   ```
+
+   `make deploy` to apply.
+2. In the panel, `/admin/users/create` — pick a username and set an
+   initial password.
+3. `/admin/users/{id}/edit` — set the user's `vault_path` to the
+   container path you just mounted (e.g. `/vaults/oksana`). The form
+   shows a dropdown of unassigned `/vaults/*` directories that exist
+   on disk.
+4. Share the credentials out-of-band. The user logs in at
+   `/admin/auth/login`, gets their own keys/OAuth/usage views, and
+   cannot see other users' notes.
+
+### What admins see
+
+Admins see API keys, OAuth clients, and usage logs for all users; they
+own the Settings page (embedding provider, indexer trigger, danger
+zone) and the Users page. Admins do **not** browse other users' vault
+contents through the panel — that's intentional. Troubleshooting
+another user's vault means either inspecting it via `docker exec` or
+temporarily reassigning their `vault_path`, not UI snooping.
+
+### Rolling back
+
+Set `MULTI_USER_MODE=false`, restart. Existing API keys keep working
+(per-user filters skip when no user context is set), the login UI and
+session cookies disappear, and the panel falls back to its
+Traefik-OAuth-only mode. The schema stays in place, so flipping back
+to multi-user later resumes where you left off without re-bootstrapping
+(the `users` table is non-empty, so `/admin/register` is closed).
+
+### Constraints and known limits
+
+- The indexer iterates active users sequentially each cycle. Fine for
+  tens of users; hundreds would need parallelization.
+- Password reset is admin-driven only — there's no email-based
+  self-service flow.
+- No rate limiting on `/admin/auth/login`. The Traefik OAuth gate in
+  front of the panel is the main brute-force defense; if you expose
+  `/admin/auth/login` to the open internet, put a rate-limit
+  middleware in front of it.
+- The `vault_path` validator does not resolve symlinks, so an admin
+  can technically point a user at host files via a symlinked
+  `/vaults/<name>`. Treat `/vaults/` as an admin-trust boundary.
+
 ## Configuration
 
 | Variable | Default | Purpose |

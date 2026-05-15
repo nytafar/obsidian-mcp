@@ -9,8 +9,10 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
+from src.auth.session import current_user_id
 from src.database import async_session
 from src.models.db import APIKey, OAuthToken
+from src.services.vault import warm_user_vault_cache
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +51,7 @@ class APIKeyMiddleware:
         token_perm = current_permission.set("read")
         token_key = current_api_key_id.set(None)
         token_oauth = current_oauth_token_id.set(None)
+        token_user = current_user_id.set(None)
 
         try:
             if token.startswith("omcp_"):
@@ -94,6 +97,13 @@ class APIKeyMiddleware:
                     # Set context variables so tools can check permission and log usage
                     current_permission.set(api_key.permission)
                     current_api_key_id.set(api_key.id)
+                    current_user_id.set(api_key.user_id)
+                    # In single-user mode `api_key.user_id` is None so this
+                    # is a no-op. In multi-user mode, warm the vault-path
+                    # cache so sync `_vault_root(user_id)` calls inside the
+                    # request handler don't hit a cold cache.
+                    if api_key.user_id is not None:
+                        await warm_user_vault_cache(session, api_key.user_id)
             else:
                 # OAuth token auth
                 token_hash = hash_key(token)
@@ -132,9 +142,13 @@ class APIKeyMiddleware:
                     current_permission.set(permission)
                     current_api_key_id.set(None)
                     current_oauth_token_id.set(oauth_token.id)
+                    current_user_id.set(oauth_token.user_id)
+                    if oauth_token.user_id is not None:
+                        await warm_user_vault_cache(session, oauth_token.user_id)
 
             await self.app(scope, receive, send)
         finally:
             current_permission.reset(token_perm)
             current_api_key_id.reset(token_key)
             current_oauth_token_id.reset(token_oauth)
+            current_user_id.reset(token_user)

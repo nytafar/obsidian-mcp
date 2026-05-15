@@ -6,19 +6,93 @@ import uuid
 from pathlib import Path
 
 import yaml
+from sqlalchemy import select
 
 from src.config import settings
 
 logger = logging.getLogger(__name__)
 
 
-def _vault_root() -> Path:
-    return Path(settings.vault_path)
+# Process-level cache of `user_id -> Path(user.vault_path)` for multi-user mode.
+# Populated via `warm_user_vault_cache(session, ...)` and invalidated by
+# `clear_user_vault_cache(user_id=...)` when the admin edits a user. Single-user
+# mode never touches this cache because `_vault_root()` is called with
+# `user_id=None` everywhere.
+_user_vault_cache: dict[int, Path] = {}
 
 
-def validate_path(relative_path: str) -> Path:
+async def warm_user_vault_cache(session, user_id: int | None = None) -> None:
+    """Populate `_user_vault_cache` for one user (or every active user).
+
+    Called by the indexer at the start of each multi-user pass, by the API-key
+    middleware after authenticating a user, and (in phase 4) by panel routes
+    before they hit vault tools. In single-user mode the cache is unused so
+    callers can skip the warmup; nothing breaks if they don't.
+    """
+    from src.models.db import User
+
+    if user_id is not None:
+        result = await session.execute(
+            select(User.id, User.vault_path).where(
+                User.id == user_id,
+                User.is_active.is_(True),
+                User.vault_path.isnot(None),
+            )
+        )
+        row = result.first()
+        if row is not None:
+            _user_vault_cache[row.id] = Path(row.vault_path)
+        return
+
+    result = await session.execute(
+        select(User.id, User.vault_path).where(
+            User.is_active.is_(True),
+            User.vault_path.isnot(None),
+        )
+    )
+    for row in result.all():
+        _user_vault_cache[row.id] = Path(row.vault_path)
+
+
+def clear_user_vault_cache(user_id: int | None = None) -> None:
+    """Drop one user (or every user) from the in-process vault-path cache.
+
+    Phase 4's admin user-edit endpoint calls this whenever it mutates
+    `users.vault_path` so the next vault op picks up the new value. With no
+    argument, clears the whole cache (useful for tests).
+    """
+    if user_id is None:
+        _user_vault_cache.clear()
+    else:
+        _user_vault_cache.pop(user_id, None)
+
+
+def _vault_root(user_id: int | None = None) -> Path:
+    """Return the vault root for the given user.
+
+    Single-user mode / `user_id is None` → `settings.vault_path` (legacy
+    behavior). Multi-user mode → cached `users.vault_path` lookup. The cache
+    must have been warmed for this user (auth middleware / indexer / panel
+    routes do this before invoking tools); a miss raises a clear RuntimeError
+    rather than silently falling back to the global path or silently blocking
+    the event loop on a sync DB call.
+    """
+    if user_id is None:
+        return Path(settings.vault_path)
+    cached = _user_vault_cache.get(user_id)
+    if cached is None:
+        raise RuntimeError(
+            f"Vault path for user_id={user_id} is not in cache. "
+            "Call `warm_user_vault_cache(session, user_id)` before using "
+            "vault tools, or check that the user has `vault_path` set and "
+            "`is_active=True`."
+        )
+    return cached
+
+
+def validate_path(relative_path: str, user_id: int | None = None) -> Path:
     """Resolve a relative path within the vault, preventing traversal."""
-    vault = _vault_root()
+    vault = _vault_root(user_id)
     resolved = (vault / relative_path).resolve()
     try:
         resolved.relative_to(vault.resolve())
@@ -27,9 +101,9 @@ def validate_path(relative_path: str) -> Path:
     return resolved
 
 
-def read_file(relative_path: str) -> dict:
+def read_file(relative_path: str, user_id: int | None = None) -> dict:
     """Read a note, returning frontmatter + content."""
-    path = validate_path(relative_path)
+    path = validate_path(relative_path, user_id=user_id)
     if not path.is_file():
         raise FileNotFoundError(f"Note not found: {relative_path}")
     raw = path.read_text(encoding="utf-8")
@@ -47,7 +121,7 @@ def read_file(relative_path: str) -> dict:
     }
 
 
-def write_file(relative_path: str, content: str) -> Path:
+def write_file(relative_path: str, content: str, user_id: int | None = None) -> Path:
     """Write content to a note atomically (tmp file in same dir + os.replace).
 
     A crash between the tmp-file write and the rename leaves the destination
@@ -55,7 +129,7 @@ def write_file(relative_path: str, content: str) -> Path:
     ever spans filesystems (EXDEV), fall back to a non-atomic copy+remove and
     log a warning.
     """
-    path = validate_path(relative_path)
+    path = validate_path(relative_path, user_id=user_id)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(
         f".tmp-{path.name}-{os.getpid()}-{uuid.uuid4().hex[:8]}"

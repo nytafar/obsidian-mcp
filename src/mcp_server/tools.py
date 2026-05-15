@@ -9,6 +9,7 @@ from pathlib import Path, PurePosixPath
 
 from sqlalchemy import text
 
+from src.auth.session import current_user_id
 from src.database import async_session
 from src.mcp_server.auth import current_api_key_id, current_oauth_token_id, current_permission
 from src.models.db import UsageLog
@@ -48,6 +49,7 @@ async def _log_usage(tool: str, params: dict, duration_ms: int, response_size: i
             session.add(UsageLog(
                 key_id=current_api_key_id.get(),
                 oauth_token_id=current_oauth_token_id.get(),
+                user_id=current_user_id.get(),
                 tool=tool,
                 params=params,
                 duration_ms=duration_ms,
@@ -97,6 +99,7 @@ async def search_notes_impl(
     frontmatter: dict | None = None,
 ) -> str:
     """Full-text keyword search across vault notes."""
+    uid = current_user_id.get()
     async with async_session() as session:
         results = await full_text_search(
             session,
@@ -105,6 +108,7 @@ async def search_notes_impl(
             limit=limit,
             tags=tags,
             frontmatter=frontmatter,
+            user_id=uid,
         )
     if not results:
         return f"No results for '{query}'"
@@ -118,8 +122,9 @@ async def search_notes_impl(
 @_tracked("read_note", ["path"])
 async def read_note_impl(path: str) -> str:
     """Read a note by its vault-relative path."""
+    uid = current_user_id.get()
     try:
-        note = read_file(path)
+        note = read_file(path, user_id=uid)
     except FileNotFoundError:
         return f"Note not found: {path}"
     except ValueError as e:
@@ -147,10 +152,11 @@ async def list_notes_impl(
     from sqlalchemy import select
     from src.models.db import NoteMetadata
 
+    uid = current_user_id.get()
     async with async_session() as session:
         stmt = select(NoteMetadata).order_by(NoteMetadata.modified_at.desc())
         stmt = apply_note_filters(
-            stmt, folder=folder or None, tags=tags, frontmatter=frontmatter
+            stmt, folder=folder or None, tags=tags, frontmatter=frontmatter, user_id=uid
         )
         stmt = stmt.limit(limit)
         result = await session.execute(stmt)
@@ -176,13 +182,16 @@ async def get_tags_impl(limit: int = 50) -> str:
     from sqlalchemy import func, select
     from src.models.db import NoteMetadata
 
+    uid = current_user_id.get()
     async with async_session() as session:
+        tag_query = select(
+            func.unnest(NoteMetadata.tags).label("tag"),
+            func.count().label("count"),
+        )
+        if uid is not None:
+            tag_query = tag_query.where(NoteMetadata.user_id == uid)
         result = await session.execute(
-            select(
-                func.unnest(NoteMetadata.tags).label("tag"),
-                func.count().label("count"),
-            )
-            .group_by("tag")
+            tag_query.group_by("tag")
             .order_by(func.count().desc())
             .limit(limit)
         )
@@ -208,9 +217,12 @@ async def get_recent_impl(
     from sqlalchemy import select
     from src.models.db import NoteMetadata
 
+    uid = current_user_id.get()
     async with async_session() as session:
         query = select(NoteMetadata).order_by(NoteMetadata.modified_at.desc())
-        query = apply_note_filters(query, folder=folder, tags=tags, frontmatter=frontmatter)
+        query = apply_note_filters(
+            query, folder=folder, tags=tags, frontmatter=frontmatter, user_id=uid
+        )
         query = query.limit(limit)
         result = await session.execute(query)
         notes = result.scalars().all()
@@ -235,6 +247,7 @@ async def semantic_search_impl(
     frontmatter: dict | None = None,
 ) -> str:
     """Vector similarity search using bge-m3 embeddings."""
+    uid = current_user_id.get()
     async with async_session() as session:
         results = await semantic_search(
             session,
@@ -243,6 +256,7 @@ async def semantic_search_impl(
             folder=folder,
             tags=tags,
             frontmatter=frontmatter,
+            user_id=uid,
         )
     if not results:
         return f"No semantic results for '{query}' (embeddings may still be building)"
@@ -257,8 +271,9 @@ async def semantic_search_impl(
 @_tracked("get_vault_guide", [])
 async def get_vault_guide_impl() -> str:
     """Return the Obsidian primer plus any vault-specific conventions from CLAUDE.md."""
+    uid = current_user_id.get()
     try:
-        note = read_file("CLAUDE.md")
+        note = read_file("CLAUDE.md", user_id=uid)
         vault_section = (
             "# Vault-Specific Conventions\n"
             "\n"
@@ -291,12 +306,13 @@ async def create_note_impl(path: str, content: str) -> str:
         return f"Content too large ({len(encoded)} bytes, max {MAX_NOTE_BYTES})"
     if not path.endswith(".md"):
         path += ".md"
+    uid = current_user_id.get()
     try:
         from src.services.vault import validate_path
-        full_path = validate_path(path)
+        full_path = validate_path(path, user_id=uid)
         if full_path.exists():
             return f"Note already exists: {path}. Use edit_note to modify it."
-        write_file(path, content)
+        write_file(path, content, user_id=uid)
         return f"Created note: {path}"
     except ValueError as e:
         return str(e)
@@ -308,11 +324,13 @@ async def get_backlinks_impl(path: str, limit: int = 50) -> str:
     from sqlalchemy import select
     from src.models.db import NoteLink, NoteMetadata
 
+    uid = current_user_id.get()
     limit = max(1, min(limit, 500))
     async with async_session() as session:
-        target = (await session.execute(
-            select(NoteMetadata).where(NoteMetadata.file_path == path)
-        )).scalar_one_or_none()
+        target_stmt = select(NoteMetadata).where(NoteMetadata.file_path == path)
+        if uid is not None:
+            target_stmt = target_stmt.where(NoteMetadata.user_id == uid)
+        target = (await session.execute(target_stmt)).scalar_one_or_none()
         if target is None:
             return f"Note not found: {path}"
 
@@ -330,6 +348,8 @@ async def get_backlinks_impl(path: str, limit: int = 50) -> str:
             .order_by(SourceMeta.file_path, NoteLink.position)
             .limit(limit)
         )
+        if uid is not None:
+            stmt = stmt.where(SourceMeta.user_id == uid)
         rows = (await session.execute(stmt)).all()
 
     if not rows:
@@ -350,10 +370,12 @@ async def get_links_impl(path: str) -> str:
     from sqlalchemy.orm import aliased
     from src.models.db import NoteLink, NoteMetadata
 
+    uid = current_user_id.get()
     async with async_session() as session:
-        source = (await session.execute(
-            select(NoteMetadata).where(NoteMetadata.file_path == path)
-        )).scalar_one_or_none()
+        src_stmt = select(NoteMetadata).where(NoteMetadata.file_path == path)
+        if uid is not None:
+            src_stmt = src_stmt.where(NoteMetadata.user_id == uid)
+        source = (await session.execute(src_stmt)).scalar_one_or_none()
         if source is None:
             return f"Note not found: {path}"
 
@@ -398,13 +420,15 @@ async def get_neighborhood_impl(path: str, depth: int = 1, limit: int = 50) -> s
     from sqlalchemy import or_, select
     from src.models.db import NoteLink, NoteMetadata
 
+    uid = current_user_id.get()
     depth = max(1, min(depth, 5))
     limit = max(1, min(limit, 200))
 
     async with async_session() as session:
-        source = (await session.execute(
-            select(NoteMetadata).where(NoteMetadata.file_path == path)
-        )).scalar_one_or_none()
+        src_stmt = select(NoteMetadata).where(NoteMetadata.file_path == path)
+        if uid is not None:
+            src_stmt = src_stmt.where(NoteMetadata.user_id == uid)
+        source = (await session.execute(src_stmt)).scalar_one_or_none()
         if source is None:
             return f"Note not found: {path}"
 
@@ -443,23 +467,33 @@ async def get_neighborhood_impl(path: str, depth: int = 1, limit: int = 50) -> s
             if truncated:
                 break
 
-        # Hydrate metadata for everything except the source.
+        # Hydrate metadata for everything except the source. The BFS edges
+        # were already scoped to this user's graph (indexer guarantees the
+        # vault_index is per-user), but we filter again here as a defense
+        # in depth so a corrupted state can't leak rows across users.
         ids = [nid for nid in seen if nid != source.id]
         if not ids:
             return f"`{path}` has no resolved-link neighbors"
-        meta_rows = (await session.execute(
-            select(NoteMetadata).where(NoteMetadata.id.in_(ids))
-        )).scalars().all()
+        meta_stmt = select(NoteMetadata).where(NoteMetadata.id.in_(ids))
+        if uid is not None:
+            meta_stmt = meta_stmt.where(NoteMetadata.user_id == uid)
+        meta_rows = (await session.execute(meta_stmt)).scalars().all()
         meta_by_id = {m.id: m for m in meta_rows}
+        # Drop any ids that the user_id filter excluded (shouldn't happen
+        # under normal operation but keeps the output consistent).
+        ids = [i for i in ids if i in meta_by_id]
+        if not ids:
+            return f"`{path}` has no resolved-link neighbors"
         # We also need `via` paths — fetch those.
         via_ids = {seen[nid]["via"] for nid in ids if seen[nid]["via"] is not None}
         via_paths = {source.id: source.file_path}
         if via_ids - {source.id}:
-            via_rows = (await session.execute(
-                select(NoteMetadata.id, NoteMetadata.file_path).where(
-                    NoteMetadata.id.in_(via_ids)
-                )
-            )).all()
+            via_stmt = select(NoteMetadata.id, NoteMetadata.file_path).where(
+                NoteMetadata.id.in_(via_ids)
+            )
+            if uid is not None:
+                via_stmt = via_stmt.where(NoteMetadata.user_id == uid)
+            via_rows = (await session.execute(via_stmt)).all()
             for vid, vpath in via_rows:
                 via_paths[vid] = vpath
 
@@ -486,12 +520,14 @@ async def find_related_impl(path: str, limit: int = 10) -> str:
     from sqlalchemy import select
     from src.models.db import NoteEmbedding, NoteMetadata
 
+    uid = current_user_id.get()
     limit = max(1, min(limit, 50))
 
     async with async_session() as session:
-        source = (await session.execute(
-            select(NoteMetadata).where(NoteMetadata.file_path == path)
-        )).scalar_one_or_none()
+        src_stmt = select(NoteMetadata).where(NoteMetadata.file_path == path)
+        if uid is not None:
+            src_stmt = src_stmt.where(NoteMetadata.user_id == uid)
+        source = (await session.execute(src_stmt)).scalar_one_or_none()
         if source is None:
             return f"Note not found: {path}"
 
@@ -526,6 +562,8 @@ async def find_related_impl(path: str, limit: int = 10) -> str:
             .order_by(NoteEmbedding.embedding.cosine_distance(avg_list))
             .limit(limit * 5)
         )
+        if uid is not None:
+            stmt = stmt.where(NoteMetadata.user_id == uid)
         rows = (await session.execute(stmt)).all()
 
     if not rows:
@@ -565,9 +603,18 @@ async def find_orphans_impl(folder: str | None = None, limit: int = 50) -> str:
     from sqlalchemy import select, union
     from src.models.db import NoteLink, NoteMetadata
 
+    uid = current_user_id.get()
     limit = max(1, min(limit, 500))
 
     async with async_session() as session:
+        # The "connected" subquery collects every NoteLink endpoint id.
+        # Since `note_links` has no `user_id`, scoping happens implicitly:
+        # the outer `NoteMetadata` query filters to this user's notes, so
+        # only those rows are candidates for orphan-ness. Any cross-user
+        # NoteLink rows (which would only exist on a corrupted state)
+        # would still appear in `connected` and exclude the corresponding
+        # note id — that's the safe direction (false negatives, not
+        # false orphans).
         sources = select(NoteLink.source_note_id.label("nid")).where(
             NoteLink.source_note_id.isnot(None)
         )
@@ -576,7 +623,7 @@ async def find_orphans_impl(folder: str | None = None, limit: int = 50) -> str:
         )
         connected = union(sources, targets).subquery()
         stmt = select(NoteMetadata).where(NoteMetadata.id.notin_(select(connected.c.nid)))
-        stmt = apply_note_filters(stmt, folder=folder)
+        stmt = apply_note_filters(stmt, folder=folder, user_id=uid)
         stmt = stmt.order_by(NoteMetadata.modified_at.desc().nullslast()).limit(limit)
         notes = (await session.execute(stmt)).scalars().all()
 
@@ -621,9 +668,10 @@ async def edit_note_impl(
             f"(got {', '.join(selected)})."
         )
 
+    uid = current_user_id.get()
     try:
         from src.services.vault import replace_section, validate_path
-        full_path = validate_path(path)
+        full_path = validate_path(path, user_id=uid)
     except ValueError as e:
         return str(e)
     if not full_path.exists():
@@ -681,7 +729,7 @@ async def edit_note_impl(
         return diff or f"No changes for {path}"
 
     try:
-        write_file(path, new_content)
+        write_file(path, new_content, user_id=uid)
     except ValueError as e:
         return str(e)
     return success_message
@@ -784,9 +832,10 @@ async def move_note_impl(
     from src.services.links import build_vault_index
     from src.services.vault import _vault_root, validate_path
 
+    uid = current_user_id.get()
     try:
-        src_full = validate_path(from_path)
-        dst_full = validate_path(to_path)
+        src_full = validate_path(from_path, user_id=uid)
+        dst_full = validate_path(to_path, user_id=uid)
     except ValueError as e:
         return str(e)
     if not src_full.is_file():
@@ -794,7 +843,7 @@ async def move_note_impl(
     if dst_full.exists():
         return f"Destination already exists: {to_path}"
 
-    vault = _vault_root().resolve()
+    vault = _vault_root(uid).resolve()
     from_rel = src_full.resolve().relative_to(vault).as_posix()
     to_rel = dst_full.resolve().relative_to(vault).as_posix()
 
@@ -802,18 +851,22 @@ async def move_note_impl(
     rewrite_sources: list[str] = []
     if rewrite_links:
         async with async_session() as session:
-            rows = (await session.execute(
-                select(NoteMetadata.file_path, NoteMetadata.id)
-            )).all()
+            rows_stmt = select(NoteMetadata.file_path, NoteMetadata.id)
+            if uid is not None:
+                rows_stmt = rows_stmt.where(NoteMetadata.user_id == uid)
+            rows = (await session.execute(rows_stmt)).all()
             pre_move_index = build_vault_index([(r.file_path, r.id) for r in rows])
             target_id = pre_move_index["paths"].get(from_rel)
             if target_id is not None:
-                src_rows = (await session.execute(
+                src_q = (
                     select(NoteMetadata.file_path)
                     .join(NoteLink, NoteLink.source_note_id == NoteMetadata.id)
                     .where(NoteLink.target_note_id == target_id)
                     .distinct()
-                )).all()
+                )
+                if uid is not None:
+                    src_q = src_q.where(NoteMetadata.user_id == uid)
+                src_rows = (await session.execute(src_q)).all()
                 rewrite_sources = [r.file_path for r in src_rows]
 
     dst_full.parent.mkdir(parents=True, exist_ok=True)
@@ -831,16 +884,38 @@ async def move_note_impl(
     db_failed = False
     try:
         async with async_session() as session:
-            await session.execute(
+            nm_update = (
                 update(NoteMetadata)
                 .where(NoteMetadata.file_path == from_rel)
                 .values(file_path=to_rel)
             )
-            await session.execute(
-                update(NoteLink)
-                .where(NoteLink.target_path == from_rel)
-                .values(target_path=to_rel)
-            )
+            if uid is not None:
+                nm_update = nm_update.where(NoteMetadata.user_id == uid)
+            await session.execute(nm_update)
+
+            # Scope the NoteLink.target_path update to this user's link rows
+            # by joining through their source notes. In single-user mode the
+            # subquery selects every notes_metadata row (user_id IS NULL) so
+            # the legacy behavior is preserved.
+            if uid is None:
+                link_update = (
+                    update(NoteLink)
+                    .where(NoteLink.target_path == from_rel)
+                    .values(target_path=to_rel)
+                )
+            else:
+                user_note_ids = select(NoteMetadata.id).where(
+                    NoteMetadata.user_id == uid
+                )
+                link_update = (
+                    update(NoteLink)
+                    .where(
+                        NoteLink.target_path == from_rel,
+                        NoteLink.source_note_id.in_(user_note_ids),
+                    )
+                    .values(target_path=to_rel)
+                )
+            await session.execute(link_update)
             await session.commit()
     except Exception as e:
         logger.warning(
@@ -853,7 +928,7 @@ async def move_note_impl(
     if rewrite_links and pre_move_index is not None:
         for src_path in rewrite_sources:
             try:
-                src_file = validate_path(src_path)
+                src_file = validate_path(src_path, user_id=uid)
                 if not src_file.is_file():
                     continue
                 content = src_file.read_text(encoding="utf-8")
@@ -861,7 +936,7 @@ async def move_note_impl(
                     content, from_rel, to_rel, src_path, pre_move_index
                 )
                 if n > 0:
-                    write_file(src_path, new_content)
+                    write_file(src_path, new_content, user_id=uid)
                     rewrites_done += n
                     files_modified += 1
             except Exception as e:
@@ -890,8 +965,9 @@ async def delete_note_impl(path: str, permanent: bool = False) -> str:
 
     from src.services.vault import _vault_root, validate_path
 
+    uid = current_user_id.get()
     try:
-        full_path = validate_path(path)
+        full_path = validate_path(path, user_id=uid)
     except ValueError as e:
         return str(e)
     if not full_path.is_file():
@@ -904,7 +980,7 @@ async def delete_note_impl(path: str, permanent: bool = False) -> str:
             return f"Permanent delete failed: {e}"
         return f"Permanently deleted: {path}"
 
-    vault = _vault_root()
+    vault = _vault_root(uid)
     trash = vault / ".trash"
     trash.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
@@ -949,8 +1025,9 @@ async def set_frontmatter_impl(
         validate_path,
     )
 
+    uid = current_user_id.get()
     try:
-        full_path = validate_path(path)
+        full_path = validate_path(path, user_id=uid)
     except ValueError as e:
         return str(e)
     if not full_path.is_file():
@@ -981,7 +1058,7 @@ async def set_frontmatter_impl(
         return f"No changes for {path}"
 
     try:
-        write_file(path, new_raw)
+        write_file(path, new_raw, user_id=uid)
     except ValueError as e:
         return str(e)
 

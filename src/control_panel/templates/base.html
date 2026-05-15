@@ -244,6 +244,47 @@
         .nav-item:hover .nav-icon,
         .nav-item.active .nav-icon { opacity: 1; }
 
+        /* ── User badge in header ── */
+        .user-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 10px;
+            padding: 6px 12px;
+            background: var(--surface-2);
+            border: 1px solid var(--border);
+            border-radius: 99px;
+            font-size: 12px;
+            color: var(--text-2);
+        }
+        .user-badge-name {
+            font-weight: 500;
+            color: var(--text);
+            letter-spacing: 0.01em;
+        }
+        .user-badge-role {
+            font-size: 9px;
+            font-weight: 700;
+            letter-spacing: 0.16em;
+            text-transform: uppercase;
+            color: var(--primary-text);
+            padding: 2px 6px;
+            border-radius: 3px;
+            background: var(--primary-glow);
+            border: 1px solid rgba(155,130,232,0.3);
+        }
+        .logout-btn {
+            background: none;
+            border: none;
+            color: var(--text-3);
+            font-size: 12px;
+            cursor: pointer;
+            padding: 4px 8px;
+            border-radius: 4px;
+            transition: color 0.15s, background 0.15s;
+            font-family: 'DM Sans', sans-serif;
+        }
+        .logout-btn:hover { color: var(--error); background: rgba(245,136,136,0.08); }
+
         /* ── Main content ── */
         .main {
             margin-left: 224px;
@@ -811,6 +852,7 @@
                 </svg>
                 Vault
             </a>
+            {% if is_admin %}
             <a href="/admin/settings" class="nav-item {% if active == 'settings' %}active{% endif %}">
                 <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
                     <circle cx="8" cy="8" r="2.2"/>
@@ -818,11 +860,34 @@
                 </svg>
                 Settings
             </a>
+
+            <div class="nav-section">Admin</div>
+            <a href="/admin/users/" class="nav-item {% if active == 'users' %}active{% endif %}">
+                <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                    <circle cx="6" cy="6" r="2.6"/>
+                    <path d="M1.5 14c0-2.6 2-4.5 4.5-4.5s4.5 1.9 4.5 4.5"/>
+                    <circle cx="11.5" cy="5" r="2"/>
+                    <path d="M14.5 12.5c0-2-1.3-3.4-3-3.4"/>
+                </svg>
+                Users
+            </a>
+            {% endif %}
         </nav>
     </aside>
 
     <!-- ── Main ── -->
     <div class="main">
+        {% if multi_user_mode and username %}
+        <div style="display:flex;justify-content:flex-end;align-items:center;gap:10px;padding:14px 48px 0;">
+            <span class="user-badge">
+                <span class="user-badge-name">{{ username }}</span>
+                {% if is_admin %}<span class="user-badge-role">Admin</span>{% endif %}
+            </span>
+            <form method="POST" action="/admin/auth/logout" style="margin:0;">
+                <button type="submit" class="logout-btn" title="Sign out">Logout</button>
+            </form>
+        </div>
+        {% endif %}
         {% block content %}{% endblock %}
     </div>
 

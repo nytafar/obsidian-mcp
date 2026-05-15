@@ -10,6 +10,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
     func,
 )
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB, TSVECTOR
@@ -24,10 +25,33 @@ class Base(DeclarativeBase):
     pass
 
 
+class User(Base):
+    __tablename__ = "users"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    username: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
+    password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+    is_admin: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    vault_path: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    last_login_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    api_keys: Mapped[list["APIKey"]] = relationship(back_populates="user", cascade="all, delete-orphan")
+    oauth_clients: Mapped[list["OAuthClient"]] = relationship(back_populates="user", cascade="all, delete-orphan")
+    oauth_tokens: Mapped[list["OAuthToken"]] = relationship(back_populates="user", cascade="all, delete-orphan")
+    notes: Mapped[list["NoteMetadata"]] = relationship(back_populates="user", cascade="all, delete-orphan")
+
+
 class APIKey(Base):
     __tablename__ = "api_keys"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True
+    )
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     key_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
     key_prefix: Mapped[str] = mapped_column(String(12), nullable=False)
@@ -40,6 +64,7 @@ class APIKey(Base):
     last_used_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     usage_logs: Mapped[list["UsageLog"]] = relationship(back_populates="api_key")
+    user: Mapped["User | None"] = relationship(back_populates="api_keys")
 
 
 class UsageLog(Base):
@@ -49,6 +74,9 @@ class UsageLog(Base):
     key_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("api_keys.id"), nullable=True)
     oauth_token_id: Mapped[int | None] = mapped_column(
         Integer, ForeignKey("oauth_tokens.id", ondelete="SET NULL"), nullable=True
+    )
+    user_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
     )
     tool: Mapped[str] = mapped_column(String(100), nullable=False)
     params: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
@@ -70,7 +98,10 @@ class NoteMetadata(Base):
     __tablename__ = "notes_metadata"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    file_path: Mapped[str] = mapped_column(String(1024), unique=True, nullable=False)
+    user_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    file_path: Mapped[str] = mapped_column(String(1024), nullable=False)
     title: Mapped[str] = mapped_column(String(512), nullable=False)
     tags: Mapped[list[str] | None] = mapped_column(ARRAY(String), nullable=True)
     frontmatter: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
@@ -86,8 +117,18 @@ class NoteMetadata(Base):
     embeddings: Mapped[list["NoteEmbedding"]] = relationship(
         back_populates="note", cascade="all, delete-orphan"
     )
+    user: Mapped["User | None"] = relationship(back_populates="notes")
 
     __table_args__ = (
+        # NULLS NOT DISTINCT so single-user-mode rows (user_id IS NULL)
+        # collide on file_path alone and the indexer's upsert fires.
+        # See migration 009 for the matching DDL.
+        UniqueConstraint(
+            "user_id",
+            "file_path",
+            name="uq_notes_metadata_user_id_file_path",
+            postgresql_nulls_not_distinct=True,
+        ),
         Index("ix_notes_metadata_tsvector", "content_tsvector", postgresql_using="gin"),
         Index("ix_notes_metadata_tags", "tags", postgresql_using="gin"),
     )
@@ -146,6 +187,9 @@ class OAuthClient(Base):
     __tablename__ = "oauth_clients"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True
+    )
     client_id: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
     client_secret_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     client_name: Mapped[str] = mapped_column(String(255), nullable=False)
@@ -155,11 +199,16 @@ class OAuthClient(Base):
         DateTime(timezone=True), server_default=func.now()
     )
 
+    user: Mapped["User | None"] = relationship(back_populates="oauth_clients")
+
 
 class OAuthCode(Base):
     __tablename__ = "oauth_codes"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True
+    )
     code_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
     client_id: Mapped[str] = mapped_column(
         String(64), ForeignKey("oauth_clients.client_id", ondelete="CASCADE"), nullable=False
@@ -179,6 +228,9 @@ class OAuthToken(Base):
     __tablename__ = "oauth_tokens"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True
+    )
     token_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
     token_type: Mapped[str] = mapped_column(String(10), nullable=False)
     client_id: Mapped[str] = mapped_column(
@@ -190,3 +242,5 @@ class OAuthToken(Base):
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+
+    user: Mapped["User | None"] = relationship(back_populates="oauth_tokens")

@@ -20,12 +20,17 @@ def apply_note_filters(
     folder: str | None = None,
     tags: list[str] | None = None,
     frontmatter: dict | None = None,
+    user_id: int | None = None,
 ) -> Select:
-    """Append optional `folder`, `tags`, `frontmatter` predicates to a select over NoteMetadata.
+    """Append optional `folder`, `tags`, `frontmatter`, `user_id` predicates
+    to a select over NoteMetadata.
 
     - `folder`: prefix match on `file_path`. LIKE wildcards (`%`, `_`, `\\`) are escaped.
     - `tags`: ARRAY containment (`notes_metadata.tags @> ARRAY[...]`). AND semantics.
     - `frontmatter`: JSONB containment (`notes_metadata.frontmatter @> :json`). Strict types.
+    - `user_id`: scope to one user. `None` (single-user mode / unset) means no
+      filter is appended, so existing NULL-user rows are returned. `int` adds
+      `.where(NoteMetadata.user_id == user_id)`.
 
     None or empty argument means "no filter" — the predicate is not appended.
     """
@@ -36,4 +41,6 @@ def apply_note_filters(
         stmt = stmt.where(NoteMetadata.tags.contains(tags))
     if frontmatter:
         stmt = stmt.where(NoteMetadata.frontmatter.contains(frontmatter))
+    if user_id is not None:
+        stmt = stmt.where(NoteMetadata.user_id == user_id)
     return stmt

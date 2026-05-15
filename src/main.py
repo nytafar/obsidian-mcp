@@ -60,10 +60,24 @@ async def _check_embedding_dim() -> None:
         sys.exit(1)
 
 
+def _on_indexer_done(task: asyncio.Task) -> None:
+    if task.cancelled():
+        logging.getLogger(__name__).info("Indexer task cancelled (lifespan shutdown)")
+        return
+    exc = task.exception()
+    if exc is not None:
+        logging.getLogger(__name__).critical(
+            "Indexer task died with unhandled exception", exc_info=exc
+        )
+    else:
+        logging.getLogger(__name__).warning("Indexer task exited without exception (should run forever)")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await _check_embedding_dim()
     indexer_task = asyncio.create_task(run_indexer_loop())
+    indexer_task.add_done_callback(_on_indexer_done)
     async with mcp.session_manager.run():
         yield
     indexer_task.cancel()
@@ -84,6 +98,21 @@ app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
 
 # GZip compression for responses >= 1000 bytes
 app.add_middleware(GZipMiddleware, minimum_size=1000)
+
+if settings.multi_user_mode:
+    from starlette.middleware.sessions import SessionMiddleware
+    # Browsers refuse Secure cookies on plain HTTP, so local dev (uvicorn on
+    # http://localhost) needs https_only=False. mcp_hostname is only set in
+    # the deployed Traefik config, so it doubles as a "this is production"
+    # signal here.
+    app.add_middleware(
+        SessionMiddleware,
+        secret_key=settings.secret_key,
+        max_age=settings.session_max_age,
+        https_only=bool(settings.mcp_hostname),
+        same_site="lax",
+        session_cookie=settings.session_cookie_name,
+    )
 
 # CORS
 app.add_middleware(
@@ -112,6 +141,20 @@ app.include_router(api_router)
 
 # Control panel routes at /admin (protected by Traefik OAuth)
 app.include_router(panel_router)
+
+# Admin user-management routes at /admin/users (admin-gated; in single-user
+# mode the sentinel is admin so the routes work too, but the sidebar link
+# is hidden when `multi_user_mode=False`).
+from src.control_panel.users import router as users_router
+app.include_router(users_router)
+
+# Multi-user auth routes (login / logout / bootstrap registration).
+# Mounted only in multi-user mode so single-user mode preserves the existing
+# Traefik-OAuth-only path; the routes would 404 in that case anyway since
+# `SessionMiddleware` isn't active.
+if settings.multi_user_mode:
+    from src.auth.routes import router as auth_router
+    app.include_router(auth_router)
 
 
 @app.get("/health")

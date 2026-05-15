@@ -37,10 +37,22 @@ services:
     env_file:
       - .env
     volumes:
+      # Max (admin) — bootstraps to vault_path=/obsidian after the flag flip.
       - ${VAULT_HOST_PATH:-./vault}:/obsidian
       - ${BACKUPS_HOST_PATH:-./backups}:/app/backups
       - /etc/timezone:/etc/timezone:ro
       - /etc/localtime:/etc/localtime:ro
+
+      # Multi-user mode (MULTI_USER_MODE=true): mount each user's host
+      # directory under /vaults/<username>. Quote any host path that
+      # contains spaces. Admin assigns the container path on the user
+      # record via /admin/users/<id>/edit.
+
+      # Oksana — assign vault_path=/vaults/oksana in the panel after she's created.
+      - "/storage/shared/Oksana Documents/Obsidian:/vaults/oksana"
+
+      # Additional users — add an entry per user as you invite them.
+      # Example: "/storage/vaults/alice:/vaults/alice"
     labels:
       - "traefik.enable=true"
       # Panel + authorize router (OAuth protected)
