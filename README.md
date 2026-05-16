@@ -518,14 +518,14 @@ vault and keys carry over to the bootstrap admin.
    ```yaml
    volumes:
      - "/storage/vaults/alice:/vaults/alice"
-     - "/storage/shared/Oksana Documents/Obsidian:/vaults/oksana"
+     - "/storage/shared/bob/Obsidian:/vaults/bob"
    ```
 
    `make deploy` to apply.
 2. In the panel, `/admin/users/create` — pick a username and set an
    initial password.
 3. `/admin/users/{id}/edit` — set the user's `vault_path` to the
-   container path you just mounted (e.g. `/vaults/oksana`). The form
+   container path you just mounted (e.g. `/vaults/bob`). The form
    shows a dropdown of unassigned `/vaults/*` directories that exist
    on disk.
 4. Share the credentials out-of-band. The user logs in at
