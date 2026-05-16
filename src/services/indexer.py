@@ -109,6 +109,84 @@ async def index_vault(user_id: int | None = None):
                 "modified_at": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc),
             })
 
+        # Compute deleted paths up front so the move-detection block can
+        # repair them before the delete/insert pipeline tears them apart.
+        deleted_paths = set(existing.keys()) - set(files.keys())
+
+        # ── Move detection ────────────────────────────────────────────────
+        # An external move (file dragged in Obsidian) looks like
+        # "delete old + insert new" from a path-only POV. Pair deleted paths
+        # with genuinely-new paths sharing the same content_hash and update
+        # `file_path` in place — preserving the row id keeps embeddings,
+        # incoming `note_links.target_note_id` refs, and avoids a dangling-
+        # link window. Falls back to delete+insert when a hash matches more
+        # than one path on either side (ambiguous — could be a real duplicate).
+        new_by_hash: dict[str, list[str]] = {}
+        for e in to_upsert:
+            if e["file_path"] not in existing:
+                new_by_hash.setdefault(e["content_hash"], []).append(e["file_path"])
+        deleted_by_hash: dict[str, list[str]] = {}
+        for p in deleted_paths:
+            deleted_by_hash.setdefault(existing[p], []).append(p)
+
+        moves: list[tuple[str, str]] = []
+        for h, olds in deleted_by_hash.items():
+            news = new_by_hash.get(h, [])
+            if len(olds) == 1 and len(news) == 1:
+                moves.append((olds[0], news[0]))
+
+        moved_new_paths: set[str] = set()
+        if moves:
+            user_clause = "user_id IS NULL" if user_id is None else "user_id = :uid"
+            move_upd_sql = (
+                "UPDATE notes_metadata "
+                "SET file_path = :new, file_size = :size, "
+                "modified_at = :mtime, indexed_at = now() "
+                f"WHERE file_path = :old AND {user_clause}"
+            )
+            # Rewrite stored `target_path` strings that referenced the old
+            # path. Two forms: the full path (`Folder/Old.md`) and the
+            # extension-stripped form (`Folder/Old`) the extractor stores for
+            # markdown links. Bare-name `[[noteName]]` references survive
+            # untouched — their `target_note_id` is preserved via id reuse
+            # and the stem doesn't change on a folder-only move.
+            move_tp_sql = (
+                "UPDATE note_links SET target_path = :new "
+                "WHERE target_path = :old "
+                f"AND source_note_id IN (SELECT id FROM notes_metadata WHERE {user_clause})"
+            )
+
+            entry_by_path = {e["file_path"]: e for e in to_upsert}
+            for old, new in moves:
+                e = entry_by_path[new]
+                params: dict = {
+                    "new": new, "old": old,
+                    "size": e["file_size"], "mtime": e["modified_at"],
+                }
+                if user_id is not None:
+                    params["uid"] = user_id
+                await session.execute(text(move_upd_sql), params)
+
+                old_no_ext = old[:-3] if old.endswith(".md") else old
+                new_no_ext = new[:-3] if new.endswith(".md") else new
+                for o, n in [(old, new), (old_no_ext, new_no_ext)]:
+                    tp_params: dict = {"new": n, "old": o}
+                    if user_id is not None:
+                        tp_params["uid"] = user_id
+                    await session.execute(text(move_tp_sql), tp_params)
+
+                moved_new_paths.add(new)
+
+            await session.commit()
+            logger.info(
+                f"Detected {len(moves)} file move(s) — preserved ids{log_suffix}"
+            )
+
+            # The existing delete+insert pipeline below mustn't touch the
+            # paths we just repaired in place.
+            to_upsert = [e for e in to_upsert if e["file_path"] not in moved_new_paths]
+            deleted_paths -= {old for old, _ in moves}
+
         # Upsert changed files
         if to_upsert:
             for batch_start in range(0, len(to_upsert), 100):
@@ -175,8 +253,9 @@ async def index_vault(user_id: int | None = None):
             await session.commit()
             logger.info(f"Updated tsvectors for {len(paths)} notes{log_suffix}")
 
-        # Remove deleted files (scoped to this user when set)
-        deleted_paths = set(existing.keys()) - set(files.keys())
+        # Remove deleted files (scoped to this user when set). `deleted_paths`
+        # was computed earlier and any entries that turned out to be moves
+        # have already been stripped out by the move-detection block above.
         if deleted_paths:
             del_stmt = delete(NoteMetadata).where(
                 NoteMetadata.file_path.in_(deleted_paths)
@@ -192,11 +271,13 @@ async def index_vault(user_id: int | None = None):
         # changed note delete-and-reinsert its rows in `note_links`. New or
         # renamed notes also get a re-resolution pass that updates any
         # previously-dangling rows now matching their path.
-        if to_upsert or deleted_paths:
+        # Moved notes need outgoing-link re-extraction too: same-folder
+        # resolution can change once the note sits in a different directory.
+        if to_upsert or deleted_paths or moved_new_paths:
             await _update_links_for_changed(
                 session,
                 vault,
-                [n["file_path"] for n in to_upsert],
+                [n["file_path"] for n in to_upsert] + list(moved_new_paths),
                 user_id=user_id,
             )
 
