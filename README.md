@@ -1,15 +1,39 @@
 # Obsidian MCP Server
 
+[![Python](https://img.shields.io/badge/python-3.12-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![MCP](https://img.shields.io/badge/MCP-compatible-7C3AED)](https://modelcontextprotocol.io)
+[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16%20%2B%20pgvector-336791?logo=postgresql&logoColor=white)](https://www.postgresql.org/)
+
 A self-hosted [Model Context Protocol](https://modelcontextprotocol.io)
-server that lets you and your AI agents work over the same Obsidian
-vault. Indexed, searchable, and self-describing, so agents pick up
-your folder layout, frontmatter schema, and tag conventions on the
-first call instead of being briefed from scratch every session.
+server that turns your Obsidian vault into shared memory between you
+and your AI agents. Indexed, searchable, and self-describing — agents
+read what you read, link what you link, and pick up your folder
+layout, frontmatter schema, and tag conventions on the first call
+instead of being briefed from scratch every session.
 
 Stack: Python 3.12, FastAPI, PostgreSQL with pgvector. Pluggable
 embeddings (Ollama bge-m3, or OpenAI `text-embedding-3-{small,large}`).
 
 ![Dashboard](screenshots/dashboard.png)
+
+## Contents
+
+- [Why this exists](#why-this-exists)
+- [A session at the keyboard](#a-session-at-the-keyboard)
+- [What's in the box](#whats-in-the-box)
+- [vs. other Obsidian MCP servers](#vs-other-obsidian-mcp-servers)
+- [Who this is for](#who-this-is-for)
+- [Control panel](#control-panel)
+- [Quick start](#quick-start)
+- [Cost expectations](#cost-expectations)
+- [The self-describing vault](#the-self-describing-vault)
+- [Multi-user mode](#multi-user-mode)
+- [Configuration](#configuration)
+- [Architecture](#architecture)
+- [Project layout](#project-layout)
+- [Development](#development)
+- [Security notes](#security-notes)
 
 ## Why this exists
 
@@ -92,6 +116,62 @@ surface a note I half-finished six months ago, and at the end of the
 conversation suggest updates and write them in. The vault doesn't
 have to be near me to be the thing I'm working in.
 
+## A session at the keyboard
+
+To make the abstract concrete, a short transcript from a real
+session. Tool calls inline; the user types in plain English and the
+agent picks the right tool.
+
+```
+you  > find anything I've written about why retrieval-augmented
+       chat is hard
+
+claude
+  → semantic_search(query="why retrieval-augmented chat is hard")
+    • 2025-12-03 - RAG failure modes.md
+    • 2025-10-18 - Chunking tradeoffs.md
+    • 2024-06-22 - Vector recall vs precision.md
+
+  the closest hit is your December note on RAG failure modes. let
+  me see what it's connected to.
+
+  → get_neighborhood(path="2025-12-03 - RAG failure modes.md",
+                     depth=1)
+    8 connected notes. notable ones:
+    • "Hybrid search" — a re-ranking design you sketched but
+      didn't ship
+    • "Out-of-distribution queries" — a half-finished draft from
+      October
+    • "Embedding model choice" — links to bge-m3, your current
+      model
+
+  you have three connected pieces here: a failure-modes catalog,
+  an unshipped hybrid-search sketch, and an abandoned O-O-D draft.
+  want me to summarize all three together, or pull up the draft
+  so you can decide whether to finish it?
+
+you  > pull up the draft, and tag it #revisit-2026 in frontmatter
+       while you're there
+
+claude
+  → read_note(path="2025-10-18 - OOD queries (draft).md")
+  → set_frontmatter(
+      path="2025-10-18 - OOD queries (draft).md",
+      updates={"tags": ["draft", "rag", "revisit-2026"]}
+    )
+
+  here's the draft, and the tag is on. you stopped right before
+  the section on confidence thresholds; the open question you
+  left yourself was…
+```
+
+Two things to notice. First, the agent didn't need to be told what
+folder to look in or what tools to use — it picked them. Second, the
+write at the end is structured (`set_frontmatter` mutating YAML, not
+a regex over the file body), so the note round-trips cleanly. The
+self-describing vault and the wikilink graph are doing the work that
+makes this feel natural.
+
 ## What's in the box
 
 The server exposes 17 MCP tools across five concerns.
@@ -149,6 +229,66 @@ The server exposes 17 MCP tools across five concerns.
 All write tools route through `src/services/vault.py::write_file`,
 which writes to a tmp file in the same directory and `os.replace()`s
 it onto the destination. A crash mid-write cannot truncate a note.
+
+## vs. other Obsidian MCP servers
+
+There are several existing MCP servers for Obsidian, and most of them
+solve a different problem than this one. The lightweight ones are
+glue over Obsidian's Local REST API plugin or the filesystem: they
+let an agent reach the files, but don't build any infrastructure of
+their own. They're great if "I just want Claude to read my notes"
+is the goal and you keep Obsidian running locally.
+
+This server is on the other end of the spectrum: a real backend with
+a persistent index, semantic retrieval, a wikilink graph, OAuth, and
+an admin UI. The cost is Postgres and Docker. The benefit is
+everything you can build on top of that.
+
+|  | This server | [MarkusPfundstein/mcp-obsidian][mp] | [StevenStavrakis/obsidian-mcp][sg] | [jacksteamdev/obsidian-mcp-tools][js] |
+| --- | --- | --- | --- | --- |
+| Persistent index (Postgres) | ✅ | — | — | — |
+| Semantic search (vectors) | ✅ | — | — | — |
+| Wikilink graph queries | ✅ | — | — | partial |
+| Runs without Obsidian open | ✅ | — | ✅ | — |
+| OAuth 2.0 client flow | ✅ | — | — | — |
+| Multi-user / per-user vaults | ✅ | — | — | — |
+| Admin UI + usage logs | ✅ | — | — | — |
+| Atomic writes + dry-run diffs | ✅ | — | — | — |
+| Setup tax | Postgres + Docker | Obsidian + REST plugin | Python only | Obsidian plugin |
+
+[mp]: https://github.com/MarkusPfundstein/mcp-obsidian
+[sg]: https://github.com/StevenStavrakis/obsidian-mcp
+[js]: https://github.com/jacksteamdev/obsidian-mcp-tools
+
+Comparison reflects each project's documented features at time of
+writing; verify the specifics before betting on them.
+
+## Who this is for
+
+- Homelab folks who already run Postgres and Docker, or are happy
+  to spin them up. The setup tax is the price of admission for the
+  semantic and graph layers.
+- People who keep an opinionated vault — task placement logic,
+  frontmatter schemas, tag taxonomy — and want agents to follow
+  those conventions on the first call instead of being briefed
+  every session.
+- Anyone running more than one MCP client (Claude Desktop, Claude
+  Code, Claude in a browser, n8n) against the same notes and tired
+  of re-explaining the vault to each.
+- Folks who want agent memory to live as plain markdown files they
+  can read, edit, grep, and version-control, not in an opaque
+  vector store or a managed memory service.
+
+### Who this isn't for
+
+- "I just want Claude to read my notes" with the lightest possible
+  setup. Use one of the filesystem-glue projects above; you don't
+  need this.
+- Anyone unwilling to run a database. There is no SQLite fallback;
+  pgvector is doing real work, and a managed Postgres with
+  pgvector support is part of the stack.
+- People who want a turnkey hosted product. This is a self-hosted
+  server you run yourself.
 
 ## Control panel
 
@@ -293,6 +433,25 @@ The first thing any agent should do in a new session is call
 `get_vault_guide()`. That's how it learns your folder structure,
 naming conventions, and YAML schema before it writes anything.
 
+## Cost expectations
+
+If you go the OpenAI route (the realistic path on a CPU-only VPS),
+the first-index spend is small and the steady state is nearly free.
+Rough numbers assuming an average note around 1,500 tokens (three
+512-token chunks), at OpenAI's published rate at time of writing:
+
+| Model | $/1M tokens | 1k notes | 10k notes | 100k notes |
+| --- | --- | --- | --- | --- |
+| `text-embedding-3-small` | $0.02 | ~$0.05 | ~$0.50 | ~$5.00 |
+| `text-embedding-3-large` | $0.13 | ~$0.30 | ~$3.00 | ~$30.00 |
+
+After the first index, only changed notes are re-embedded. Ongoing
+cost is proportional to edits — pennies a month for a typical vault.
+
+If you self-host Ollama with a GPU, embedding cost is whatever your
+power bill is. Ollama on CPU works but is too slow to be usable on
+a vault of more than a few hundred notes.
+
 ## The self-describing vault
 
 This is the part most "MCP for Obsidian" projects miss. They stop at
@@ -423,21 +582,8 @@ to multi-user later resumes where you left off without re-bootstrapping
 | `CHUNK_SIZE` | `512` | Approx tokens per chunk (4-char heuristic) |
 | `CHUNK_OVERLAP` | `0` | Token overlap between chunks |
 
-See `.env.example` for the full set with comments.
-
-### Cost expectations (OpenAI)
-
-Rough first-index spend, assuming an average note around 1,500 tokens
-(three 512-token chunks). Pricing is OpenAI's published rate at time
-of writing.
-
-| Model | $/1M tokens | 1k notes | 10k notes | 100k notes |
-| --- | --- | --- | --- | --- |
-| `text-embedding-3-small` | $0.02 | ~$0.05 | ~$0.50 | ~$5.00 |
-| `text-embedding-3-large` | $0.13 | ~$0.30 | ~$3.00 | ~$30.00 |
-
-After the first index, only changed notes are re-embedded. Ongoing
-cost is proportional to edits.
+See `.env.example` for the full set with comments. For first-index
+spend on OpenAI, see [Cost expectations](#cost-expectations) above.
 
 ### Switching providers
 

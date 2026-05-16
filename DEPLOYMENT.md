@@ -330,5 +330,8 @@ is pennies a month.
 - Vault encryption at rest. Files on the VPS disk are plain text
   unless you set up an encrypted filesystem. If you need that, look at
   LUKS for the data volume.
-- Multi-user vaults. This server is designed for a single vault.
-  Multi-tenant is a possible future direction, not built today.
+- Multi-user vaults are supported but not detailed here. The default
+  deployment is single-vault. To run multiple users with isolated
+  vaults on the same container, see the **Multi-user mode** section in
+  the [README](./README.md#multi-user-mode): bootstrap flow, inviting
+  users, the admin role, and rollback are covered there.
