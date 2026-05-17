@@ -27,7 +27,7 @@ mcp = FastMCP(
     stateless_http=True,
     streamable_http_path="/",
     transport_security=TransportSecuritySettings(
-        enable_dns_rebinding_protection=True,
+        enable_dns_rebinding_protection=not settings.mcp_sandbox_mode,
         allowed_hosts=settings.allowed_hosts,
     ),
 )

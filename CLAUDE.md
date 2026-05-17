@@ -67,6 +67,7 @@ hostnames) must stay out of tracked files. The mechanism:
   after a 5x overfetch
 - Indexer runs on startup then every 5 minutes, hash-based change detection
 - Wikilink graph extracted from note bodies into `note_links`; resolved at index time with same-folder-first preference
+- `MCP_SANDBOX_MODE=true` is a registry-eval-only switch: lifespan skips `_check_embedding_dim` and the indexer, and `APIKeyMiddleware` bypasses auth on `/mcp/*`. Lets Glama's sandbox build the image and validate MCP introspection without external deps. Never enable in production — tools register but cannot run.
 
 ## Embedding providers
 - `EMBEDDING_PROVIDER=ollama` (default) — uses `OLLAMA_URL` and

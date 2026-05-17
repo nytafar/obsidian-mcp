@@ -581,6 +581,7 @@ to multi-user later resumes where you left off without re-bootstrapping
 | `OPENAI_EMBEDDING_MODEL` | `text-embedding-3-small` | OpenAI model |
 | `CHUNK_SIZE` | `512` | Approx tokens per chunk (4-char heuristic) |
 | `CHUNK_OVERLAP` | `0` | Token overlap between chunks |
+| `MCP_SANDBOX_MODE` | `false` | Registry-eval only. Skips DB, indexer, embedding provider, and `/mcp` auth so introspection works without external deps. Do not enable in production. |
 
 See `.env.example` for the full set with comments. For first-index
 spend on OpenAI, see [Cost expectations](#cost-expectations) above.

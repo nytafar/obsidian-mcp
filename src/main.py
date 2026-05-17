@@ -75,6 +75,14 @@ def _on_indexer_done(task: asyncio.Task) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    if settings.mcp_sandbox_mode:
+        logging.getLogger(__name__).warning(
+            "MCP_SANDBOX_MODE active — skipping DB check and indexer. "
+            "Tools are registered but cannot run. Registry-eval only."
+        )
+        async with mcp.session_manager.run():
+            yield
+        return
     await _check_embedding_dim()
     indexer_task = asyncio.create_task(run_indexer_loop())
     indexer_task.add_done_callback(_on_indexer_done)

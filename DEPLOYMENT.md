@@ -83,6 +83,12 @@ OPENAI_EMBEDDING_MODEL=text-embedding-3-small
 Generate a strong DB password and use it in both `DATABASE_URL` and
 the Postgres service env in the compose file (Step 3).
 
+> Leave `MCP_SANDBOX_MODE` unset (it appears commented-out in
+> `.env.example`). It exists only for the Glama registry's automated
+> sandbox build, where it bypasses Postgres, the embedding provider,
+> the vault, and `/mcp` auth so introspection can complete. Setting it
+> in production disables every external dependency.
+
 ## Step 3. Bring up Postgres, MCP, and Caddy
 
 The repo ships a `docker-compose.simple.yml` designed for fresh VPS

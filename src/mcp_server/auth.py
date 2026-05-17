@@ -10,6 +10,7 @@ from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from src.auth.session import current_user_id
+from src.config import settings
 from src.database import async_session
 from src.models.db import APIKey, OAuthToken
 from src.services.vault import warm_user_vault_cache
@@ -34,6 +35,10 @@ class APIKeyMiddleware:
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send):
         if scope["type"] not in ("http", "websocket"):
+            await self.app(scope, receive, send)
+            return
+
+        if settings.mcp_sandbox_mode:
             await self.app(scope, receive, send)
             return
 

@@ -37,6 +37,13 @@ class Settings(BaseSettings):
     session_max_age: int = 60 * 60 * 24 * 7
     session_cookie_name: str = "omcp_session"
 
+    # Registry-eval only: when true, lifespan skips the DB dim check,
+    # indexer, and embedding provider, and the /mcp auth middleware
+    # short-circuits. Lets Glama's sandbox build the image and validate
+    # MCP introspection without real external deps. Never enable in
+    # production — tools register but cannot run.
+    mcp_sandbox_mode: bool = False
+
     model_config = {"env_file": ".env"}
 
     @model_validator(mode="after")
