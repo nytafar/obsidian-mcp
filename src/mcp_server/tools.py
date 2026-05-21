@@ -1,22 +1,21 @@
 import logging
-import os
 import re
-import shutil
 import time
-from datetime import datetime, timezone
+from datetime import timezone
 from functools import wraps
 from pathlib import Path, PurePosixPath
+from uuid import uuid4
 
 from sqlalchemy import text
 
 from src.auth.session import current_user_id
 from src.database import async_session
-from src.mcp_server.auth import current_api_key_id, current_oauth_token_id, current_permission
-from src.models.db import UsageLog
+from src.mcp_server.auth import current_permission
+from src.services import usage, vault
 from src.services.embeddings import semantic_search
 from src.services.filters import apply_note_filters
 from src.services.search import full_text_search
-from src.services.vault import read_file, write_file
+from src.services.vault import read_file
 
 logger = logging.getLogger(__name__)
 
@@ -43,23 +42,6 @@ _NO_CLAUDE_MD_MESSAGE = (
 )
 
 
-async def _log_usage(tool: str, params: dict, duration_ms: int, response_size: int):
-    try:
-        async with async_session() as session:
-            session.add(UsageLog(
-                key_id=current_api_key_id.get(),
-                oauth_token_id=current_oauth_token_id.get(),
-                user_id=current_user_id.get(),
-                tool=tool,
-                params=params,
-                duration_ms=duration_ms,
-                response_size=response_size,
-            ))
-            await session.commit()
-    except Exception as e:
-        logger.warning(f"Failed to log usage for {tool}: {e}")
-
-
 _MAX_PARAM_LEN = 200  # truncate long string params (e.g. note content)
 
 
@@ -75,17 +57,32 @@ def _tracked(tool_name: str, param_keys: list[str]):
     def decorator(fn):
         @wraps(fn)
         async def wrapper(*args, **kwargs):
+            token = None
+            if usage.current_correlation_id.get() is None:
+                token = usage.current_correlation_id.set(uuid4().hex)
             start = time.monotonic()
-            result = await fn(*args, **kwargs)
-            duration_ms = int((time.monotonic() - start) * 1000)
-            params = {}
-            for i, key in enumerate(param_keys):
-                if i < len(args):
-                    params[key] = args[i]
-                elif key in kwargs:
-                    params[key] = kwargs[key]
-            await _log_usage(tool_name, _truncate_params(params), duration_ms, len(str(result)))
-            return result
+            try:
+                result = await fn(*args, **kwargs)
+                duration_ms = int((time.monotonic() - start) * 1000)
+                params = {}
+                for i, key in enumerate(param_keys):
+                    if i < len(args):
+                        params[key] = args[i]
+                    elif key in kwargs:
+                        params[key] = kwargs[key]
+                correlation_id = usage.current_correlation_id.get()
+                if correlation_id:
+                    params["correlation_id"] = correlation_id
+                await usage.log_usage(
+                    tool_name,
+                    _truncate_params(params),
+                    duration_ms,
+                    len(str(result)),
+                )
+                return result
+            finally:
+                if token is not None:
+                    usage.current_correlation_id.reset(token)
         return wrapper
     return decorator
 
@@ -312,7 +309,7 @@ async def create_note_impl(path: str, content: str) -> str:
         full_path = validate_path(path, user_id=uid)
         if full_path.exists():
             return f"Note already exists: {path}. Use edit_note to modify it."
-        write_file(path, content, user_id=uid)
+        await vault.write_file(path, content, user_id=uid)
         return f"Created note: {path}"
     except ValueError as e:
         return str(e)
@@ -728,8 +725,17 @@ async def edit_note_impl(
         ))
         return diff or f"No changes for {path}"
 
+    if new_content == existing:
+        return f"No changes for {path}"
+
     try:
-        write_file(path, new_content, user_id=uid)
+        await vault.write_file(
+            path,
+            new_content,
+            user_id=uid,
+            backup_tool="edit_note",
+            backup_target=path,
+        )
     except ValueError as e:
         return str(e)
     return success_message
@@ -843,9 +849,9 @@ async def move_note_impl(
     if dst_full.exists():
         return f"Destination already exists: {to_path}"
 
-    vault = _vault_root(uid).resolve()
-    from_rel = src_full.resolve().relative_to(vault).as_posix()
-    to_rel = dst_full.resolve().relative_to(vault).as_posix()
+    vault_root = _vault_root(uid).resolve()
+    from_rel = src_full.resolve().relative_to(vault_root).as_posix()
+    to_rel = dst_full.resolve().relative_to(vault_root).as_posix()
 
     pre_move_index: dict | None = None
     rewrite_sources: list[str] = []
@@ -869,17 +875,20 @@ async def move_note_impl(
                 src_rows = (await session.execute(src_q)).all()
                 rewrite_sources = [r.file_path for r in src_rows]
 
-    dst_full.parent.mkdir(parents=True, exist_ok=True)
     try:
-        os.replace(src_full, dst_full)
+        from_rel, to_rel = await vault.move_file(
+            from_path,
+            to_path,
+            user_id=uid,
+            backup_tool="move_note",
+            backup_target=f"{from_rel} -> {to_rel}",
+        )
+    except FileNotFoundError:
+        return f"Source note not found: {from_path}"
+    except FileExistsError:
+        return f"Destination already exists: {to_path}"
     except OSError as e:
-        if getattr(e, "errno", None) == 18:
-            logger.warning(
-                "Cross-FS move for %s → %s; using shutil.move", from_rel, to_rel
-            )
-            shutil.move(str(src_full), str(dst_full))
-        else:
-            return f"Move failed: {e}"
+        return f"Move failed: {e}"
 
     db_failed = False
     try:
@@ -936,7 +945,11 @@ async def move_note_impl(
                     content, from_rel, to_rel, src_path, pre_move_index
                 )
                 if n > 0:
-                    write_file(src_path, new_content, user_id=uid)
+                    await vault.write_file(
+                        src_path,
+                        new_content,
+                        user_id=uid,
+                    )
                     rewrites_done += n
                     files_modified += 1
             except Exception as e:
@@ -963,7 +976,7 @@ async def delete_note_impl(path: str, permanent: bool = False) -> str:
     if err := _require_write():
         return err
 
-    from src.services.vault import _vault_root, validate_path
+    from src.services.vault import validate_path
 
     uid = current_user_id.get()
     try:
@@ -973,31 +986,22 @@ async def delete_note_impl(path: str, permanent: bool = False) -> str:
     if not full_path.is_file():
         return f"Note not found: {path}"
 
-    if permanent:
-        try:
-            os.unlink(full_path)
-        except OSError as e:
-            return f"Permanent delete failed: {e}"
-        return f"Permanently deleted: {path}"
-
-    vault = _vault_root(uid)
-    trash = vault / ".trash"
-    trash.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    base = f"{timestamp}-{full_path.name}"
-    dest = trash / base
-    counter = 1
-    while dest.exists():
-        dest = trash / f"{timestamp}-{counter}-{full_path.name}"
-        counter += 1
     try:
-        os.replace(full_path, dest)
+        rel = await vault.delete_file(
+            path,
+            user_id=uid,
+            permanent=permanent,
+            backup_tool="delete_note",
+            backup_target=path,
+        )
+    except FileNotFoundError:
+        return f"Note not found: {path}"
     except OSError as e:
-        if getattr(e, "errno", None) == 18:
-            shutil.move(str(full_path), str(dest))
-        else:
-            return f"Soft-delete failed: {e}"
-    rel = dest.relative_to(vault).as_posix()
+        if permanent:
+            return f"Permanent delete failed: {e}"
+        return f"Soft-delete failed: {e}"
+    if permanent:
+        return f"Permanently deleted: {path}"
     return f"Soft-deleted: {path} → {rel}"
 
 
@@ -1058,7 +1062,13 @@ async def set_frontmatter_impl(
         return f"No changes for {path}"
 
     try:
-        write_file(path, new_raw, user_id=uid)
+        await vault.write_file(
+            path,
+            new_raw,
+            user_id=uid,
+            backup_tool="set_frontmatter",
+            backup_target=path,
+        )
     except ValueError as e:
         return str(e)
 

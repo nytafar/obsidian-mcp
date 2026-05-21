@@ -105,4 +105,4 @@ Link extraction lives in `src/services/links.py`. The extractor strips fenced/in
 - `delete_note(path, permanent=False)` — soft-delete to `.trash/<YYYYMMDD-HHMMSS>-<basename>` by default; `permanent=True` does a hard `os.unlink`. The indexer skips dot-dirs, so search/embedding cleanup happens on the next reindex pass.
 - `set_frontmatter(path, updates, remove=[])` — structured YAML frontmatter mutation. Round-trips via `yaml.safe_dump` (does not preserve YAML comments). Leaves the body byte-identical.
 
-All write tools route through `src/services/vault.py::write_file`, which writes to a tmp file in the same directory and `os.replace()`s it into place — a crash mid-write cannot truncate the destination.
+All vault mutations route through `src/services/vault.py` service helpers. Content writes use `write_file`, which writes to a tmp file in the same directory and `os.replace()`s it into place — a crash mid-write cannot truncate the destination. Destructive tools (`edit_note`, `move_note`, `delete_note`, `set_frontmatter`) first ask the git safety layer to snapshot dirty vault worktree state so incoming LiveSync changes are preserved before the MCP mutates files.

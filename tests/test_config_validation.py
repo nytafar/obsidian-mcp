@@ -39,6 +39,13 @@ def test_ollama_default_no_key_required():
     assert s.embedding_provider == "ollama"
 
 
+def test_git_backup_defaults():
+    s = Settings(_env_file=None)
+    assert s.git_backup_enabled is None
+    assert s.git_author_name == "Hvelv MCP Agent"
+    assert s.git_author_email == "mcp-agent@hvelv.local"
+
+
 def test_invalid_provider_value():
     with pytest.raises(ValidationError):
         Settings(embedding_provider="cohere", _env_file=None)

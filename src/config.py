@@ -37,6 +37,10 @@ class Settings(BaseSettings):
     session_max_age: int = 60 * 60 * 24 * 7
     session_cookie_name: str = "omcp_session"
 
+    git_backup_enabled: bool | None = None
+    git_author_name: str = "Hvelv MCP Agent"
+    git_author_email: str = "mcp-agent@hvelv.local"
+
     # Registry-eval only: when true, lifespan skips the DB dim check,
     # indexer, and embedding provider, and the /mcp auth middleware
     # short-circuits. Lets Glama's sandbox build the image and validate

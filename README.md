@@ -226,9 +226,12 @@ The server exposes 17 MCP tools across five concerns.
 - Every tool call is logged to `usage_logs` with name, params
   (truncated to 200 chars), duration, and response size.
 
-All write tools route through `src/services/vault.py::write_file`,
-which writes to a tmp file in the same directory and `os.replace()`s
-it onto the destination. A crash mid-write cannot truncate a note.
+All vault mutations route through `src/services/vault.py` service
+helpers. Content writes use `write_file`, which writes to a tmp file
+in the same directory and `os.replace()`s it onto the destination. A
+crash mid-write cannot truncate a note. Destructive tools first ask the
+git safety layer to snapshot any dirty vault worktree state, so incoming
+LiveSync changes are preserved before the MCP mutates files.
 
 ## vs. other Obsidian MCP servers
 
@@ -581,6 +584,9 @@ to multi-user later resumes where you left off without re-bootstrapping
 | `OPENAI_EMBEDDING_MODEL` | `text-embedding-3-small` | OpenAI model |
 | `CHUNK_SIZE` | `512` | Approx tokens per chunk (4-char heuristic) |
 | `CHUNK_OVERLAP` | `0` | Token overlap between chunks |
+| `GIT_BACKUP_ENABLED` | auto | When unset, auto-detects whether `VAULT_PATH` is a git worktree. `true` forces checks; `false` disables them. |
+| `GIT_AUTHOR_NAME` | `Hvelv MCP Agent` | Author/committer name for incoming snapshot commits |
+| `GIT_AUTHOR_EMAIL` | `mcp-agent@hvelv.local` | Author/committer email for incoming snapshot commits |
 | `MCP_SANDBOX_MODE` | `false` | Registry-eval only. Skips DB, indexer, embedding provider, and `/mcp` auth so introspection works without external deps. Do not enable in production. |
 
 See `.env.example` for the full set with comments. For first-index
