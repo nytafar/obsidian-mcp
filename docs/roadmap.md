@@ -44,6 +44,7 @@
 | 2.3 | **Facet tools** `get_kinds`/`get_states` (C2) | Schema becomes discoverable | low |
 | 2.4 | **Index freshness / write-through** (E7) | Fixes write→query loop | med |
 | 2.5 | Expose `usage_logs` as a tool/resource (E6) | Memory primitive + eval source | low |
+| 2.6 | **`.base`-filter → SQL translator** — reuse existing `.base` defs as server-side saved queries (see `bases-and-query-layer.md`) | Bases-grade queries, headless, no Electron | low |
 
 ## Tier 3 — The pivot (ops / memory layer + interface)
 
