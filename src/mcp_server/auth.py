@@ -46,7 +46,14 @@ class APIKeyMiddleware:
         auth_header = request.headers.get("authorization", "")
 
         if not auth_header.startswith("Bearer "):
-            response = JSONResponse({"error": "Missing Bearer token"}, status_code=401)
+            resource_metadata = f"{settings.base_url}/.well-known/oauth-protected-resource/mcp"
+            response = JSONResponse(
+                {"error": "Missing Bearer token"},
+                status_code=401,
+                headers={
+                    "WWW-Authenticate": f'Bearer resource_metadata="{resource_metadata}"',
+                },
+            )
             await response(scope, receive, send)
             return
 
