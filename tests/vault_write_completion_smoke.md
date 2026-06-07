@@ -72,7 +72,7 @@ needs at the top and references them by name. Final cleanup at the bottom.
 ### 1.3 Crash-mid-write does not truncate the destination (manual)
 - This requires shell access to the container. Skip if not feasible.
 - In a Python REPL inside the container, monkey-patch `Path.write_text` to
-  raise mid-call, then call `write_file("Cards/_smoke/atomic.md", "REPLACED")`.
+  raise mid-call, then call `await write_file("Cards/_smoke/atomic.md", "REPLACED")`.
 - PASS if: the call raises, AND `cat Cards/_smoke/atomic.md` still prints
   `hello` (unchanged), AND any `.tmp-*atomic.md*` orphan in
   `Cards/_smoke/` has been cleaned up.

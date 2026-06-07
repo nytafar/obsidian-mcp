@@ -9,6 +9,7 @@ import yaml
 from sqlalchemy import select
 
 from src.config import settings
+from src.services import git_backup
 
 logger = logging.getLogger(__name__)
 
@@ -121,7 +122,30 @@ def read_file(relative_path: str, user_id: int | None = None) -> dict:
     }
 
 
-def write_file(relative_path: str, content: str, user_id: int | None = None) -> Path:
+async def _snapshot_before_destructive_write(
+    tool: str | None,
+    target: str,
+    *,
+    user_id: int | None,
+) -> None:
+    if tool is None:
+        return
+    await git_backup.snapshot_if_dirty(
+        _vault_root(user_id),
+        tool,
+        target,
+        user_id=user_id,
+    )
+
+
+async def write_file(
+    relative_path: str,
+    content: str,
+    user_id: int | None = None,
+    *,
+    backup_tool: str | None = None,
+    backup_target: str | None = None,
+) -> Path:
     """Write content to a note atomically (tmp file in same dir + os.replace).
 
     A crash between the tmp-file write and the rename leaves the destination
@@ -130,6 +154,11 @@ def write_file(relative_path: str, content: str, user_id: int | None = None) -> 
     log a warning.
     """
     path = validate_path(relative_path, user_id=user_id)
+    await _snapshot_before_destructive_write(
+        backup_tool,
+        backup_target or relative_path,
+        user_id=user_id,
+    )
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(
         f".tmp-{path.name}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
@@ -155,6 +184,95 @@ def write_file(relative_path: str, content: str, user_id: int | None = None) -> 
             pass
         raise
     return path
+
+
+async def move_file(
+    from_path: str,
+    to_path: str,
+    user_id: int | None = None,
+    *,
+    backup_tool: str | None = None,
+    backup_target: str | None = None,
+) -> tuple[str, str]:
+    """Move a vault file, preserving same-FS atomic rename where possible."""
+    src_full = validate_path(from_path, user_id=user_id)
+    dst_full = validate_path(to_path, user_id=user_id)
+    if not src_full.is_file():
+        raise FileNotFoundError(f"Source note not found: {from_path}")
+    if dst_full.exists():
+        raise FileExistsError(f"Destination already exists: {to_path}")
+
+    vault = _vault_root(user_id).resolve()
+    from_rel = src_full.resolve().relative_to(vault).as_posix()
+    to_rel = dst_full.resolve().relative_to(vault).as_posix()
+
+    await _snapshot_before_destructive_write(
+        backup_tool,
+        backup_target or f"{from_rel} -> {to_rel}",
+        user_id=user_id,
+    )
+
+    dst_full.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.replace(src_full, dst_full)
+    except OSError as e:
+        if getattr(e, "errno", None) == 18:
+            logger.warning(
+                "Cross-FS move for %s → %s; using shutil.move", from_rel, to_rel
+            )
+            shutil.move(str(src_full), str(dst_full))
+        else:
+            raise
+    return from_rel, to_rel
+
+
+async def delete_file(
+    relative_path: str,
+    user_id: int | None = None,
+    *,
+    permanent: bool = False,
+    backup_tool: str | None = None,
+    backup_target: str | None = None,
+) -> str | None:
+    """Delete a vault file permanently or move it under `.trash/`.
+
+    Returns the trash-relative path for soft deletes and `None` for permanent
+    deletes.
+    """
+    path = validate_path(relative_path, user_id=user_id)
+    if not path.is_file():
+        raise FileNotFoundError(f"Note not found: {relative_path}")
+
+    await _snapshot_before_destructive_write(
+        backup_tool,
+        backup_target or relative_path,
+        user_id=user_id,
+    )
+
+    if permanent:
+        os.unlink(path)
+        return None
+
+    vault = _vault_root(user_id)
+    trash = vault / ".trash"
+    trash.mkdir(parents=True, exist_ok=True)
+    from datetime import datetime, timezone
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    base = f"{timestamp}-{path.name}"
+    dest = trash / base
+    counter = 1
+    while dest.exists():
+        dest = trash / f"{timestamp}-{counter}-{path.name}"
+        counter += 1
+    try:
+        os.replace(path, dest)
+    except OSError as e:
+        if getattr(e, "errno", None) == 18:
+            shutil.move(str(path), str(dest))
+        else:
+            raise
+    return dest.relative_to(vault).as_posix()
 
 
 def parse_frontmatter(raw: str) -> tuple[dict, str]:
