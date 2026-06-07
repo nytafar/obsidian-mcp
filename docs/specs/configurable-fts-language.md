@@ -9,15 +9,28 @@
 
 ## 0. Operating instructions for the implementing agent
 
-- **Branch off `origin/main`** (the clean upstream line) — NOT `experiments` (that
-  branch carries unrelated planning docs + parallel commits). Name it e.g.
-  `feat/configurable-fts-language`.
-- **Do not push to or rewrite `main`.** Open a PR from the feature branch into
-  `main`. This change is intended to be upstream-PR quality for the original
-  project, so keep it minimal, focused, and backward-compatible.
-- **Conventional commits**, matching repo style (`feat(...)`, `fix(...)`,
-  `chore(...)`, `docs(...)`). Suggested PR title:
-  `feat(search): configurable full-text search language(s)`.
+**PR target is UPSTREAM (Max's repo), not the fork.**
+- `origin` = the fork: `https://github.com/nytafar/obsidian-mcp`
+- `upstream` = the target: `https://github.com/maxkuminov/obsidian-mcp` (per `README.md`)
+
+Flow:
+1. Add the upstream remote and fetch it:
+   `git remote add upstream https://github.com/maxkuminov/obsidian-mcp.git && git fetch upstream`
+2. **Branch off `upstream/main`** — NOT `origin/main` and NOT `experiments`.
+   (`origin/main` may carry the fork's own unsynced commit; `experiments` carries
+   unrelated planning docs. Only `upstream/main` is a clean base for an upstream
+   PR.) Name it `feat/configurable-fts-language`.
+3. Implement, commit (conventional commits — `feat(...)`/`fix(...)`/`docs(...)`).
+4. Push the feature branch to **`origin`** (the fork): `git push -u origin feat/configurable-fts-language`.
+5. Open a **cross-fork PR**: base = `maxkuminov/obsidian-mcp` `main`, head =
+   `nytafar:feat/configurable-fts-language`. Suggested title:
+   `feat(search): configurable full-text search language(s)`.
+- **Do not push to or rewrite any `main`** (fork or upstream).
+- **Tooling caveat:** if GitHub tooling is repo-scoped to `nytafar/*`, opening a PR
+  whose *base repo* is `maxkuminov/obsidian-mcp` may be denied — in that case push
+  the branch to the fork and open the cross-fork PR manually on GitHub (or have
+  the maintainer-scope added first). Confirm the PR target with the user before
+  opening.
 - Keep the diff tight: this PR is **only** the FTS-config feature. Do **not**
   bundle the chunking fixes, hybrid fusion, or reranking (separate PRs).
 
@@ -49,6 +62,7 @@ settable via the existing env/pydantic-settings mechanism, defaulting to
 **Non-goals (out of scope — do not implement here):**
 - No web-UI editing and **no runtime settings store** — config file/env only.
 - No hybrid fusion, reranking, chunking changes, or schema migration.
+- **No per-user FTS config** — this setting is **global** (see §4.1).
 
 ## 3. How PostgreSQL FTS works (background)
 
@@ -99,6 +113,26 @@ deployments are unaffected until they change the setting.
 **No schema migration:** `content_tsvector` stays `TSVECTOR` regardless of config.
 The only consequence of a config change is that stored tsvectors must be
 **rebuilt** (data operation, see §7) — no Alembic migration needed.
+
+### 4.1 Multi-user scope — GLOBAL
+
+`FTS_CONFIGS` is a **single global setting**, applied to every user's vault. This
+is consistent with the existing architecture: `embedding_model`,
+`embedding_dimensions`, and `chunk_size` are all global env settings too — the
+server runs one embedding/indexing configuration for all users. FTS config
+follows the same model.
+
+For a mixed-language multi-user instance, the **multi-config list is exactly the
+accommodation**: set a superset (e.g. `["english","norwegian"]`, or `["simple"]`)
+and every user's vault is served reasonably without per-user configuration.
+
+**Why not per-user (and why it's deferred, not impossible):** per-user FTS *would*
+be coherent — each `notes_metadata` row carries `user_id`/`owner`, so you could
+index each note under its owner's config and query under the searcher's config,
+and the existing per-user result scoping guarantees index/query configs align.
+But it requires a **per-user settings store**, which has been explicitly deferred
+(this project is config/env only for now). So: global for this PR; per-user is a
+clean future extension once a settings store exists. Do not build it here.
 
 ## 5. Implementation by file
 
@@ -233,7 +267,8 @@ mechanism.
 - [ ] `make rebuild-tsvectors` recomputes all tsvectors with no API calls.
 - [ ] Default config reproduces current behavior (a regression test asserts this).
 - [ ] Unit + integration tests pass; docs updated.
-- [ ] Diff is scoped to FTS only; branched off `main`; PR opened into `main`.
+- [ ] Diff scoped to FTS only; branched off **`upstream/main`**; cross-fork PR opened with base `maxkuminov/obsidian-mcp:main`, head `nytafar:feat/configurable-fts-language`.
+- [ ] Setting is global (no per-user config introduced).
 
 ## 12. Design rationale (for the PR description)
 Keyword search is the *exact-match* arm (identifiers, proper nouns, phrases);
